@@ -406,7 +406,27 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
 #endif
 
 #if defined(DATA_A_Q6_K)
-// 2-byte loads for Q6_K blocks (210 bytes)
+// Q6_K blocks are 210 bytes, so a block starts 4-byte aligned only every other block.
+// Instead of 2-byte loads, read 32-bit words and realign with a funnel shift
+// (5 dword loads for 16 bytes instead of 8 word loads).
+layout (binding = 0) readonly buffer A_RAW32_Q6K {uint data_a_raw32[];};
+
+uvec4 load16_q6k(const uint byte_off) {
+    // byte_off is always even
+    const uint w = byte_off >> 2;
+    const uint sh = (byte_off & 2u) << 3; // 0 or 16
+    const uint w0 = data_a_raw32[w    ];
+    const uint w1 = data_a_raw32[w + 1];
+    const uint w2 = data_a_raw32[w + 2];
+    const uint w3 = data_a_raw32[w + 3];
+    if (sh == 0u) {
+        return uvec4(w0, w1, w2, w3);
+    }
+    const uint w4 = data_a_raw32[w + 4];
+    return uvec4((w0 >> 16) | (w1 << 16), (w1 >> 16) | (w2 << 16),
+                 (w2 >> 16) | (w3 << 16), (w3 >> 16) | (w4 << 16));
+}
+
 i32vec4 repack4(uint ib, uint iqs) {
     const uint ib_k = ib / 8;
     const uint iqs_k = (ib % 8) * 8 + iqs;
@@ -417,23 +437,9 @@ i32vec4 repack4(uint ib, uint iqs) {
     const uint qh_idx = (iqs_k / 32) * 8 + iqs;
     const uint qh_shift = ((iqs_k % 32) / 8) * 2;
 
-    const uvec4 ql = uvec4( uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2    ]) |
-                           (uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2 + 1]) << 16),
-                            uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2 + 2]) |
-                           (uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2 + 3]) << 16),
-                            uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2 + 4]) |
-                           (uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2 + 5]) << 16),
-                            uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2 + 6]) |
-                           (uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2 + 7]) << 16));
-
-    const uvec4 qh = uvec4( uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2    ]) |
-                           (uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2 + 1]) << 16),
-                            uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2 + 2]) |
-                           (uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2 + 3]) << 16),
-                            uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2 + 4]) |
-                           (uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2 + 5]) << 16),
-                            uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2 + 6]) |
-                           (uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2 + 7]) << 16));
+    const uint block_off = ib_k * 210u;
+    const uvec4 ql = load16_q6k(block_off + ql_idx * 4u);
+    const uvec4 qh = load16_q6k(block_off + 128u + qh_idx * 4u);
 
     const uint vals0 = (( ql.x >> ql_shift) & 0x0F0F0F0F) |
                        (((qh.x >> qh_shift) & 0x03030303) << 4);
