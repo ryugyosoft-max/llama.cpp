@@ -1,0 +1,76 @@
+#version 450
+
+// Single-row RMS_NORM * weight that also writes the result as block_q8_1_x4, so the
+// following MMVQ matmuls can skip their own quantize dispatch and barrier.
+// Decode path: one workgroup, each thread keeps up to NV vec4 of the row in registers.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+
+#include "types.glsl"
+
+layout (push_constant) uniform parameter {
+    uint ncols;
+    float eps;
+} p;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 1024;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+const uint NV = 4;
+
+layout (binding = 0) readonly buffer A {vec4 data_a[];};
+layout (binding = 1) readonly buffer W {vec4 data_w[];};
+layout (binding = 2) writeonly buffer D {vec4 data_d[];};
+layout (binding = 3) writeonly buffer Q {block_q8_1_x4 data_q[];};
+
+shared float sumsh[BLOCK_SIZE / 8];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint nv4 = p.ncols / 4;
+
+    vec4 v[NV];
+    float ss = 0.0f;
+    [[unroll]] for (uint k = 0; k < NV; ++k) {
+        const uint idx = tid + k * BLOCK_SIZE;
+        v[k] = idx < nv4 ? data_a[idx] : vec4(0.0f);
+        ss += dot(v[k], v[k]);
+    }
+
+    ss = subgroupAdd(ss);
+    if (subgroupElect()) {
+        sumsh[gl_SubgroupID] = ss;
+    }
+    barrier();
+    float total = 0.0f;
+    for (uint i = 0; i < gl_NumSubgroups; ++i) {
+        total += sumsh[i];
+    }
+    const float scale = inversesqrt(total / float(p.ncols) + p.eps);
+
+    [[unroll]] for (uint k = 0; k < NV; ++k) {
+        const uint idx = tid + k * BLOCK_SIZE;
+        // ncols % 128 == 0, so each cluster of 8 lanes (one q8_1 block) is entirely in or out of range
+        if (idx < nv4) {
+            const vec4 o = v[k] * scale * data_w[idx];
+            data_d[idx] = o;
+
+            const vec4 a = abs(o);
+            const float amax = subgroupClusteredMax(max(max(a.x, a.y), max(a.z, a.w)), 8);
+            const float d = amax / 127.0;
+            const float d_inv = d != 0.0 ? 1.0 / d : 0.0;
+            const vec4 qv = round(o * d_inv);
+            const uint ib = idx / 8;
+            const uint iqs = idx % 8;
+            data_q[ib / 4].qs[(ib % 4) * 8 + iqs] = pack32(i8vec4(qv));
+            const float qsum = subgroupClusteredAdd(qv.x + qv.y + qv.z + qv.w, 8);
+            if (iqs == 0) {
+                data_q[ib / 4].ds[ib % 4] = f16vec2(vec2(d, qsum * d));
+            }
+        }
+    }
+}

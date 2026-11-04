@@ -3279,6 +3279,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
 
+    if (device->subgroup_clustered && device->subgroup_require_full_support && device->subgroup_arithmetic &&
+        device->vendor_id == VK_VENDOR_ID_INTEL && device->architecture == INTEL_XE1 &&
+        device->properties.limits.maxComputeWorkGroupInvocations >= 1024) {
+        // [a770-opt] fused single-row RMS_NORM*MUL + q8_1 quantization for decode
+        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_q8_1_f32, "rms_norm_mul_q8_1_f32", rms_norm_mul_q8_1_f32_len, rms_norm_mul_q8_1_f32_data, "main", 4, 2 * sizeof(uint32_t), {1, 1, 1}, { 1024 }, 1, true, true);
+    }
     if (device->subgroup_clustered && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_subgroup_len, quantize_q8_1_x4_subgroup_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
     } else {
@@ -11048,6 +11054,49 @@ static void ggml_vk_rms_norm_finish(ggml_backend_vk_context * ctx, const ggml_te
     }
 }
 
+// [a770-opt] Decode-time RMS_NORM*MUL that also leaves dst quantized to q8_1_x4 in prealloc_y,
+// so the next MMVQ matmuls reading dst skip ggml_vk_quantize_q8_1 and its barrier.
+static bool ggml_vk_try_rms_norm_mul_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0,
+                                          const ggml_tensor * weight, ggml_tensor * dst, float eps) {
+    static const bool disabled = getenv("GGML_VK_DISABLE_RMS_Q8_1") != nullptr;
+    vk_pipeline pipeline = ctx->device->pipeline_rms_norm_mul_q8_1_f32;
+    if (disabled || !pipeline || ctx->fused_rms_norm_mode != RMS_NORM_MUL || ctx->do_add_rms_partials) {
+        return false;
+    }
+    const int64_t ncols = src0->ne[0];
+    if (src0->type != GGML_TYPE_F32 || weight->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        ggml_nrows(src0) != 1 || ggml_nelements(weight) != ncols || ggml_nelements(dst) != ncols ||
+        ncols % 128 != 0 || ncols > 4 * 4 * 1024 ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(weight) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    const size_t q_size = (size_t)(ncols / 128) * sizeof(uint32_t) * 36; // block_q8_1_x4 = 144 bytes
+    if (!ctx->prealloc_y || ctx->prealloc_y->size < q_size) {
+        return false;
+    }
+    const vk_subbuffer s_a = ggml_vk_tensor_subbuffer(ctx, src0, true);
+    const vk_subbuffer s_w = ggml_vk_tensor_subbuffer(ctx, weight, true);
+    const vk_subbuffer s_d = ggml_vk_tensor_subbuffer(ctx, dst, true);
+    if (s_a.size != (size_t)ggml_nbytes(src0) || s_w.size != (size_t)ggml_nbytes(weight) || s_d.size != (size_t)ggml_nbytes(dst)) {
+        return false; // misaligned views: use the generic shader
+    }
+    vk_pipeline to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
+    if (!to_q8_1) {
+        return false;
+    }
+    if (ctx->prealloc_y_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+    struct { uint32_t ncols; float eps; } pc = { (uint32_t)ncols, eps };
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { s_a, s_w, s_d, ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) }, pc, { 1, 1, 1 });
+    ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
+    ctx->prealloc_y_last_tensor_used = dst;
+    ctx->prealloc_y_last_k_padded = false;
+    ctx->prealloc_y_need_sync = true;
+    return true;
+}
+
 void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx, float * op_params) {
     ggml_tensor * rms = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = rms->src[0];
@@ -11226,6 +11275,10 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
             }, pc, elements);
     } else {
         GGML_ASSERT(ctx->fused_rms_norm_mode == RMS_NORM_MUL || ctx->fused_rms_norm_mode == RMS_NORM_COUNT);
+        if (ggml_vk_try_rms_norm_mul_q8_1(ctx, subctx, src0, src1, dst, op_params[0])) {
+            ggml_vk_rms_norm_finish(ctx, src0);
+            return;
+        }
         ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM, std::move(bin));
     }
 
