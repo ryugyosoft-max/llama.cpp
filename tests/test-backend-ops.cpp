@@ -14163,6 +14163,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, m, 1, 4096, {1, 1}, {1, 1}));
         }
     }
+    // [a770-opt] Qwen3.5-9B attention decode: hs=256, 4 KV heads x GQA 4 = 16 q heads, n=1
+    for (int kv : {4096, 16384, 32768}) {
+        for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, t, t));
+        }
+    }
     // [a770-opt] model-shaped decode GEMVs (Qwen3.5-9B / LFM3-1.7B)
     for (ggml_type ta : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
         for (auto mk : std::vector<std::pair<int,int>>{{12288, 4096}, {4096, 12288}, {8192, 4096}, {2048, 8192}, {8192, 2048}}) {

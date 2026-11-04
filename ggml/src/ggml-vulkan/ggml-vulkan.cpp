@@ -1249,6 +1249,13 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 
     result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
 
+    // [a770-opt] Intel Xe-HPG (A770): staging K/V through shared memory makes long-context decode
+    // attention much faster (32K context: ~1.9ms -> ~1.0ms per layer for hs=256, GQA 4), but costs a
+    // little at short context.
+    if (device->vendor_id == VK_VENDOR_ID_INTEL && device->architecture == INTEL_XE1 && n_rows <= 8 && n_kv >= 4096 && hsk <= 256 && hsv <= 256) {
+        result.shmem_staging = 1;
+    }
+
     if (!reduce_block_rows && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
         result.block_rows /= 2;
     }
