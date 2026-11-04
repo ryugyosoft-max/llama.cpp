@@ -1,0 +1,110 @@
+#version 450
+
+// [a770-opt] Split-k reduce for fa_decode_xe1 (one query token).
+// Workgroup = one head x 64 output dims. The split weights are computed once into shared
+// memory, then each thread sums its dim over the splits with independent (unrolled) loads.
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {float data_a[];};
+layout (binding = 1) readonly buffer B {float data_s[];};
+layout (binding = 2) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint D;
+    uint ne1;
+    uint ne2;
+    uint ne3;
+    uint k_num;
+    uint sinks;
+} p;
+
+const uint MAXK = 512;
+shared float sh_w[MAXK];
+shared float sh_red[64];
+
+void main() {
+    const uint n = gl_WorkGroupID.x;      // head
+    const uint tid = gl_LocalInvocationID.x;
+    const uint i3 = gl_WorkGroupID.z;
+    const uint D = p.D;
+    const uint k_num = p.k_num;
+
+    const uint lm_base = D * p.ne1 * k_num * p.ne3 + p.ne1 * 2 * (k_num * i3) + n;
+    const uint lm_stride = p.ne1 * 2;
+
+    float m_max = -1.0 / 0.0;
+    for (uint k = tid; k < k_num; k += 64) {
+        m_max = max(m_max, data_a[lm_base + p.ne1 + k * lm_stride]);
+    }
+    sh_red[tid] = m_max;
+    barrier();
+    [[unroll]] for (uint s = 32; s > 0; s >>= 1) {
+        if (tid < s) {
+            sh_red[tid] = max(sh_red[tid], sh_red[tid + s]);
+        }
+        barrier();
+    }
+    m_max = sh_red[0];
+    barrier();
+
+    float L = 0.0;
+    for (uint k = tid; k < k_num; k += 64) {
+        const float w = exp(data_a[lm_base + p.ne1 + k * lm_stride] - m_max);
+        sh_w[k] = w;
+        L += w * data_a[lm_base + k * lm_stride];
+    }
+    sh_red[tid] = L;
+    barrier();
+    [[unroll]] for (uint s = 32; s > 0; s >>= 1) {
+        if (tid < s) {
+            sh_red[tid] += sh_red[tid + s];
+        }
+        barrier();
+    }
+    L = sh_red[0];
+
+    float sink = 0.0;
+    float ms = 1.0;
+    if (p.sinks != 0) {
+        sink = data_s[n];
+        float vs = 1.0;
+        if (sink > m_max) {
+            ms = exp(m_max - sink);
+        } else {
+            vs = exp(sink - m_max);
+        }
+        L = L * ms + vs;
+    }
+    L = (L == 0.0) ? 0.0 : 1.0 / L;
+
+    const uint d = gl_WorkGroupID.y * 64 + tid;
+    if (d >= D) {
+        return;
+    }
+    const uint o_stride = D * p.ne1;
+    const uint o_base = o_stride * k_num * i3 + D * n + d;
+
+    float acc[8];
+    [[unroll]] for (uint u = 0; u < 8; ++u) {
+        acc[u] = 0.0;
+    }
+    uint k = 0;
+    for (; k + 8 <= k_num; k += 8) {
+        [[unroll]] for (uint u = 0; u < 8; ++u) {
+            acc[u] += sh_w[k + u] * data_a[o_base + (k + u) * o_stride];
+        }
+    }
+    for (; k < k_num; ++k) {
+        acc[0] += sh_w[k] * data_a[o_base + k * o_stride];
+    }
+    float O = ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+    O *= ms * L;
+
+    const float FLT_MAX = uintBitsToFloat(0x7F7FFFFF);
+    O = clamp(O, -FLT_MAX, FLT_MAX);
+
+    data_d[i3 * p.ne2 * p.ne1 * D + D * n + d] = O;
+}

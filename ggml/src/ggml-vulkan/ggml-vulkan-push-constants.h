@@ -81,6 +81,25 @@ struct vk_mat_vec_id_push_constants {
     uint32_t nbi1;
 };
 
+struct vk_fa_decode_xe1_push_constants {
+    uint32_t KV;
+    uint32_t split_kv;
+    uint32_t k_num;
+    uint32_t ne1;
+    uint32_t q_head;
+    uint32_t q_batch;
+    uint32_t k_row;
+    uint32_t k_head;
+    uint32_t k_batch;
+    uint32_t v_row;
+    uint32_t v_head;
+    uint32_t v_batch;
+    uint32_t m_batch;
+    uint32_t nem3;
+    uint32_t has_mask;
+    float scale;
+};
+
 struct vk_flash_attn_push_constants {
     uint32_t N;
     uint32_t KV;

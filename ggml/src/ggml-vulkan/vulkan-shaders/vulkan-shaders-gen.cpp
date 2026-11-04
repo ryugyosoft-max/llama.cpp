@@ -960,6 +960,8 @@ void process_shaders() {
     string_to_spv("quantize_q8_1_x4", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}});
     string_to_spv("quantize_q8_1_x4_subgroup", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"USE_SUBGROUPS", "1"}});
     string_to_spv("rms_norm_mul_q8_1_f32", "rms_norm_mul_q8_1.comp", {});
+    string_to_spv("fa_decode_xe1", "fa_decode_xe1.comp", {});
+    string_to_spv("fa_decode_xe1_reduce", "fa_decode_xe1_reduce.comp", {});
     string_to_spv("swiglu_q8_1_f32", "swiglu_q8_1.comp", {});
 
     string_to_spv("mul_f32", "mul.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});

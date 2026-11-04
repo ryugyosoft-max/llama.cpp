@@ -3293,6 +3293,27 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_q8_1_f32, "rms_norm_mul_q8_1_f32", rms_norm_mul_q8_1_f32_len, rms_norm_mul_q8_1_f32_data, "main", 4, 2 * sizeof(uint32_t), {1, 1, 1}, { 1024 }, 1, true, true);
         ggml_vk_create_pipeline(device, device->pipeline_swiglu_q8_1_f32, "swiglu_q8_1_f32", swiglu_q8_1_f32_len, swiglu_q8_1_f32_data, "main", 4, sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1, true, true);
     }
+    if (device->vendor_id == VK_VENDOR_ID_INTEL && device->architecture == INTEL_XE1 && device->fp16 &&
+        device->subgroup_arithmetic && device->subgroup_shuffle && device->subgroup_size_control &&
+        device->subgroup_require_full_support &&
+        device->subgroup_min_size <= 8 && device->subgroup_max_size >= 16) {
+        // [a770-opt] dedicated single-token GQA flash-decoding (f16 K/V)
+        const uint32_t xe1_dec_sg = getenv("GGML_VK_FA_DECODE_XE1_SG") ? atoi(getenv("GGML_VK_FA_DECODE_XE1_SG")) : 8;
+        // dims of a head split over DS subgroups (fewer registers per lane)
+        device->fa_decode_xe1_ds[0] = getenv("GGML_VK_FA_DECODE_XE1_DS128") ? atoi(getenv("GGML_VK_FA_DECODE_XE1_DS128")) : 2;
+        device->fa_decode_xe1_ds[1] = getenv("GGML_VK_FA_DECODE_XE1_DS256") ? atoi(getenv("GGML_VK_FA_DECODE_XE1_DS256")) : 4;
+        const uint32_t * xe1_ds = device->fa_decode_xe1_ds;
+        device->fa_decode_xe1_kvh = getenv("GGML_VK_FA_DECODE_XE1_KVH") ? atoi(getenv("GGML_VK_FA_DECODE_XE1_KVH")) : 1;
+        const uint32_t xe1_kvh = device->fa_decode_xe1_kvh;
+        ggml_vk_create_pipeline(device, device->pipeline_fa_decode_xe1_reduce, "fa_decode_xe1_reduce", fa_decode_xe1_reduce_len, fa_decode_xe1_reduce_data, "main", 3,
+                                sizeof(vk_op_flash_attn_split_k_reduce_push_constants), {1, 1, 1}, {}, 1, true);
+        for (uint32_t di = 0; di < 2; ++di) {
+            for (uint32_t g = 2; g <= 8; ++g) {
+                ggml_vk_create_pipeline(device, device->pipeline_fa_decode_xe1[di][g], "fa_decode_xe1", fa_decode_xe1_len, fa_decode_xe1_data, "main", 5,
+                                        sizeof(vk_fa_decode_xe1_push_constants), {1, 1, 1}, {xe1_dec_sg * g * xe1_ds[di] * xe1_kvh * std::max(1u, 16u / (g * xe1_ds[di] * xe1_kvh)), di ? 256u : 128u, g, xe1_dec_sg, std::max(1u, 16u / (g * xe1_ds[di] * xe1_kvh)), xe1_ds[di], xe1_kvh}, 1, true, true, xe1_dec_sg);
+            }
+        }
+    }
     if (device->subgroup_clustered && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_subgroup_len, quantize_q8_1_x4_subgroup_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
     } else {
@@ -8564,6 +8585,40 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         use_mask_opt = false;
     }
 
+    // [a770-opt] dedicated flash-decoding for one query token with GQA on Intel Xe-HPG
+    vk_pipeline xe1_dec_pipeline = nullptr;
+    uint32_t xe1_dec_r = 1;
+    {
+        static const bool xe1_dec_disable = getenv("GGML_VK_DISABLE_FA_DECODE_XE1") != nullptr;
+        static const uint32_t xe1_dec_min_kv = getenv("GGML_VK_FA_DECODE_XE1_MIN_KV") ? atoi(getenv("GGML_VK_FA_DECODE_XE1_MIN_KV")) : 512;
+        static const uint32_t xe1_dec_split = getenv("GGML_VK_FA_DECODE_XE1_SPLIT") ? atoi(getenv("GGML_VK_FA_DECODE_XE1_SPLIT")) : 0;
+        static const uint32_t xe1_dec_target_wg = getenv("GGML_VK_FA_DECODE_XE1_WG") ? atoi(getenv("GGML_VK_FA_DECODE_XE1_WG")) : 256;
+        auto al16 = [](size_t x) { return (x % 16) == 0; };
+        const uint32_t di = HSK == 256 ? 1 : 0;
+        if (!xe1_dec_disable && !xe_fa_opt && !use_sparse && !use_dequant_kv &&
+            neq1 == 1 && gqa_ratio >= 2 && gqa_ratio <= 8 &&
+            HSK == HSV && (HSK == 128 || HSK == 256) && KV >= xe1_dec_min_kv &&
+            k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+            max_bias == 0.0f && logit_softcap == 0.0f &&
+            (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= KV && (mask->nb[3] % 2) == 0)) &&
+            al16(nbq2) && al16(nbq3) && al16(nbk1) && al16(nbk2) && al16(nbk3) && al16(nbv1) && al16(nbv2) && al16(nbv3) &&
+            (nek2 % ctx->device->fa_decode_xe1_kvh) == 0 &&
+            ctx->device->pipeline_fa_decode_xe1[di][gqa_ratio] != nullptr) {
+            xe1_dec_pipeline = ctx->device->pipeline_fa_decode_xe1[di][gqa_ratio];
+            // enough workgroups to fill the GPU (16 subgroups each), at least 2 splits
+            const uint32_t heads_wg = (uint32_t)(nek2 / ctx->device->fa_decode_xe1_kvh * neq3);
+            const uint32_t want = xe1_dec_split ? CEIL_DIV(KV, xe1_dec_split) : std::max(2u, CEIL_DIV(xe1_dec_target_wg, heads_wg));
+            // each workgroup writes R = 16/gqa partial results (one per subgroup row)
+            xe1_dec_r = std::max(1u, 16u / (gqa_ratio * ctx->device->fa_decode_xe1_ds[di] * ctx->device->fa_decode_xe1_kvh));
+            split_kv = ROUNDUP_POW2(CEIL_DIV(KV, std::min(512u / xe1_dec_r, std::max(2u, want))), 16);
+            split_k = CEIL_DIV(KV, split_kv) * xe1_dec_r;
+            GGML_ASSERT(split_k <= 512);
+            use_mask_opt = false;
+            ggml_pipeline_request_descriptor_sets(ctx, xe1_dec_pipeline, 1);
+            ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_fa_decode_xe1_reduce, 1);
+        }
+    }
+
     // Reserve space for split_k temporaries. For each split x batch, we need to store the O matrix (D x ne1)
     // and the per-row m and L values (ne1 rows). We store all the matrices first, followed by the rows.
     // For matrices, the order is (inner to outer) [HSV, ne1, k, ne2, ne3].
@@ -8750,7 +8805,32 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                               mask_n_head_log2, m0, m1,
                                               gqa_ratio, split_kv, split_k };
 
-    if (xe_fa_opt && split_k > 1) {
+    if (xe1_dec_pipeline && split_k > 1) {
+        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
+        if (ctx->prealloc_split_k_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        const vk_fa_decode_xe1_push_constants dpc = {
+            KV, split_kv, split_k, (uint32_t)ne1,
+            (uint32_t)(nbq2 / 16), (uint32_t)(nbq3 / 16),
+            (uint32_t)(nbk1 / 16), (uint32_t)(nbk2 / 16), (uint32_t)(nbk3 / 16),
+            (uint32_t)(nbv1 / 16), (uint32_t)(nbv2 / 16), (uint32_t)(nbv3 / 16),
+            mask ? (uint32_t)(mask->nb[3] / sizeof(ggml_fp16_t)) : 0u,
+            mask ? std::max<uint32_t>(1u, (uint32_t)mask->ne[3]) : 1u,
+            mask ? 1u : 0u,
+            scale,
+        };
+        vk_subbuffer split_k_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+        ggml_vk_dispatch_pipeline(ctx, subctx, xe1_dec_pipeline,
+                                  {q_buf, k_buf, v_buf, mask_buf, split_k_buf},
+                                  dpc, { split_k / xe1_dec_r, (uint32_t)nek2 / ctx->device->fa_decode_xe1_kvh, (uint32_t)neq3 });
+        ggml_vk_sync_buffers(ctx, subctx);
+        const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { HSV, (uint32_t)ne1, (uint32_t)ne2, (uint32_t)ne3, split_k, (sinks != nullptr) };
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_fa_decode_xe1_reduce,
+                                    {split_k_buf, sinks_buf, dst_buf},
+                                    pc2, { (uint32_t)ne1, CEIL_DIV(HSV, 64), (uint32_t)ne3 });
+        ctx->prealloc_split_k_need_sync = true;
+    } else if (xe_fa_opt && split_k > 1) {
         auto upper_power_of_2 = [&](uint32_t in) {
             GGML_ASSERT(in != 0);
             if (in <= 1) return 1u;

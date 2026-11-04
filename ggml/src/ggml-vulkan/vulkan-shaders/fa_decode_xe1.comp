@@ -1,0 +1,195 @@
+#version 450
+
+// [a770-opt] Flash-decoding for a single query token with grouped query attention, f16 K/V.
+//
+// One workgroup handles one KV head and one contiguous chunk of the KV sequence ("split").
+// Its subgroups are indexed (dsub, hsub, rsub):
+//   hsub: query head kv_head*GQA + hsub (all heads of a workgroup read the same K/V rows,
+//         so only the first read of a row goes to memory)
+//   dsub: which 1/DS of the head dims this subgroup owns; partial scores are exchanged
+//         through shared memory once per step. Splitting the dims keeps the per-lane state
+//         (Q slice, O accumulators) small, which leaves registers for loads in flight.
+//   rsub: steps of the split are interleaved over R subgroup rows; every row writes its own
+//         partial result, merged by fa_decode_xe1_reduce.
+//
+// Within a subgroup each lane owns DPL consecutive dims. T = SG tokens per step: every lane
+// computes partial dots for the T tokens, a butterfly reduce-scatter leaves lane t with the
+// score of token t, then the online softmax update needs one subgroup max, and the V
+// accumulation broadcasts each token's probability with a shuffle.
+//
+// Output is the split-k partial layout:
+//   O at D*ne1*(split + k_num*iq3) + head*D, then L/M per head after all O.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+layout(constant_id = 0) const uint WG_SIZE = 128;
+layout(constant_id = 1) const uint D = 256;
+layout(constant_id = 2) const uint GQA = 4;
+layout(constant_id = 3) const uint SG = 8;
+layout(constant_id = 4) const uint R = 4;
+layout(constant_id = 5) const uint DS = 1;
+layout(constant_id = 6) const uint KVH = 1;   // KV heads per workgroup (contiguous rows)
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+const uint DPL = D / (SG * DS); // dims per lane
+const uint NV = DPL / 8;        // uvec4 (8 x f16) loads per lane per row
+const uint T = SG;              // tokens per step
+
+layout (binding = 0) readonly buffer Q {vec4 data_q[];};
+layout (binding = 1) readonly buffer K {uvec4 data_k[];};
+layout (binding = 2) readonly buffer V {uvec4 data_v[];};
+layout (binding = 3) readonly buffer M {float16_t data_m[];};
+layout (binding = 4) writeonly buffer O {float data_o[];};
+
+layout (push_constant) uniform parameter {
+    uint KV;
+    uint split_kv;
+    uint k_num;
+    uint ne1;        // number of query heads
+    uint q_head;     // Q head stride, in vec4
+    uint q_batch;    // Q batch stride, in vec4
+    uint k_row;      // K row stride, in uvec4
+    uint k_head;
+    uint k_batch;
+    uint v_row;
+    uint v_head;
+    uint v_batch;
+    uint m_batch;    // mask batch stride, in f16 elements
+    uint nem3;
+    uint has_mask;
+    float scale;
+} p;
+
+// partial scores, double buffered by step parity: [2][R*GQA][DS][T]
+shared float sh_s[DS > 1 ? 2 * R * KVH * GQA * DS * T : 1];
+
+f16vec2 q[NV * 4];
+vec4 o[NV * 2];
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sgid = gl_SubgroupID;
+    const uint dsub = sgid % DS;
+    const uint hsub = (sgid / DS) % GQA;
+    const uint kvsub = (sgid / (DS * GQA)) % KVH;
+    const uint rsub = sgid / (DS * GQA * KVH);
+    const uint split = gl_WorkGroupID.x;
+    const uint kvh = gl_WorkGroupID.y * KVH + kvsub;
+    const uint iq3 = gl_WorkGroupID.z;
+    const uint head = kvh * GQA + hsub;
+    const uint dim0 = dsub * (D / DS) + lane * DPL;
+
+    {
+        const uint qo = iq3 * p.q_batch + head * p.q_head + dim0 / 4;
+        [[unroll]] for (uint i = 0; i < NV * 2; ++i) {
+            const vec4 qv = data_q[qo + i] * p.scale;
+            q[2 * i]     = f16vec2(qv.xy);
+            q[2 * i + 1] = f16vec2(qv.zw);
+        }
+    }
+    [[unroll]] for (uint i = 0; i < NV * 2; ++i) {
+        o[i] = vec4(0.0);
+    }
+
+    const float NEG_HALF_FLT_MAX = -uintBitsToFloat(0x7F7FFFFF) * 0.5;
+    float m_run = NEG_HALF_FLT_MAX;
+    float l_lane = 0.0;
+
+    const uint start = split * p.split_kv;
+    const uint end = min(p.KV, start + p.split_kv);
+    // uniform trip count over the workgroup (needed by the barriers when DS > 1)
+    const uint n_steps = (end - start + T * R - 1) / (T * R);
+
+    const uint kbase = iq3 * p.k_batch + kvh * p.k_head + dim0 / 8;
+    const uint vbase = iq3 * p.v_batch + kvh * p.v_head + dim0 / 8;
+    const uint mbase = (iq3 % p.nem3) * p.m_batch;
+    const uint sh_row = ((rsub * KVH + kvsub) * GQA + hsub) * DS;
+
+    for (uint st = 0; st < n_steps; ++st) {
+        const uint j = start + (st * R + rsub) * T;
+
+        float s[T];
+        [[unroll]] for (uint t = 0; t < T; ++t) {
+            const uint tok = min(j + t, end - 1);
+            float acc = 0.0;
+            [[unroll]] for (uint i = 0; i < NV; ++i) {
+                const uvec4 kk = data_k[kbase + tok * p.k_row + i];
+                f16vec2 a = unpackFloat2x16(kk.x) * q[4 * i];
+                a = fma(unpackFloat2x16(kk.y), q[4 * i + 1], a);
+                a = fma(unpackFloat2x16(kk.z), q[4 * i + 2], a);
+                a = fma(unpackFloat2x16(kk.w), q[4 * i + 3], a);
+                acc += float(a.x) + float(a.y);
+            }
+            s[t] = acc;
+        }
+
+        // butterfly reduce-scatter: lane t ends with the (partial) score of token t
+        [[unroll]] for (uint off = T / 2; off > 0; off >>= 1) {
+            const bool upper = (lane & off) != 0;
+            [[unroll]] for (uint i = 0; i < off; ++i) {
+                const float send = upper ? s[i] : s[i + off];
+                const float keep = upper ? s[i + off] : s[i];
+                s[i] = keep + subgroupShuffleXor(send, off);
+            }
+        }
+
+        float score = s[0];
+        if (DS > 1) {
+            const uint buf = (st & 1) * (R * KVH * GQA * DS * T);
+            sh_s[buf + (sh_row + dsub) * T + lane] = score;
+            barrier();
+            score = 0.0;
+            [[unroll]] for (uint d2 = 0; d2 < DS; ++d2) {
+                score += sh_s[buf + (sh_row + d2) * T + lane];
+            }
+        }
+
+        const uint my_tok = j + lane;
+        if (my_tok >= end) {
+            score = -1.0 / 0.0;
+        } else if (p.has_mask != 0) {
+            score += float(data_m[mbase + my_tok]);
+        }
+
+        const float m_new = max(m_run, subgroupMax(score));
+        const float alpha = exp(m_run - m_new);
+        const float pr = exp(score - m_new);
+        m_run = m_new;
+        l_lane = l_lane * alpha + pr;
+
+        [[unroll]] for (uint i = 0; i < NV * 2; ++i) {
+            o[i] *= alpha;
+        }
+
+        [[unroll]] for (uint t = 0; t < T; ++t) {
+            const float pt = subgroupShuffle(pr, t);
+            const uint tok = min(j + t, end - 1);
+            [[unroll]] for (uint i = 0; i < NV; ++i) {
+                const uvec4 vv = data_v[vbase + tok * p.v_row + i];
+                o[2 * i]     += pt * vec4(unpackHalf2x16(vv.x), unpackHalf2x16(vv.y));
+                o[2 * i + 1] += pt * vec4(unpackHalf2x16(vv.z), unpackHalf2x16(vv.w));
+            }
+        }
+    }
+
+    const float l_sum = subgroupAdd(l_lane);
+
+    // each subgroup row is its own split for the reduce
+    const uint osplit = split * R + rsub;
+    const uint o_off = D * p.ne1 * (osplit + p.k_num * iq3) + head * D + dim0;
+    [[unroll]] for (uint i = 0; i < NV * 2; ++i) {
+        [[unroll]] for (uint c = 0; c < 4; ++c) {
+            data_o[o_off + i * 4 + c] = o[i][c];
+        }
+    }
+    if (lane == 0 && dsub == 0) {
+        const uint lm_off = D * p.ne1 * p.k_num * gl_NumWorkGroups.z + p.ne1 * 2 * (osplit + p.k_num * iq3) + head;
+        data_o[lm_off] = l_sum;
+        data_o[lm_off + p.ne1] = m_run;
+    }
+}
