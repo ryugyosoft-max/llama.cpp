@@ -14157,6 +14157,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int n : {2, 3, 4, 8}) {
             test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
         }
+    // [a770-opt] small-m decode GEMVs (Qwen3.5 GDN alpha/beta: m=32, k=4096)
+    for (ggml_type ta : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16}) {
+        for (int m : {16, 32, 64, 128, 1024}) {
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, m, 1, 4096, {1, 1}, {1, 1}));
+        }
+    }
+
+    for (float n : {128.0f, 4096.0f, 32768.0f, 1048576.0f}) {
+        test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, n, 1.0f));
     }
 
     // speculative decoding attention: the DFlash2 drafter block (hd 128, 8 KV heads x 4,

@@ -6766,6 +6766,12 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
             return false;
         }
 
+        // A770 (Xe-HPG) Linux: Q8_0 MMVQ has a ~10us floor for few rows
+        // (17.5us vs 8.8us for m=32, k=4096); the two paths meet around m=1024.
+        if (src0_type == GGML_TYPE_Q8_0 && device->architecture != vk_device_architecture::INTEL_XE2 && m < 1024) {
+            return false;
+        }
+
         switch (src0_type) {
         // From tests on A770 Linux, may need more tuning
         case GGML_TYPE_Q4_0:
