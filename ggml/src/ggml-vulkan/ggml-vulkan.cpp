@@ -3284,6 +3284,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         device->properties.limits.maxComputeWorkGroupInvocations >= 1024) {
         // [a770-opt] fused single-row RMS_NORM*MUL + q8_1 quantization for decode
         ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_q8_1_f32, "rms_norm_mul_q8_1_f32", rms_norm_mul_q8_1_f32_len, rms_norm_mul_q8_1_f32_data, "main", 4, 2 * sizeof(uint32_t), {1, 1, 1}, { 1024 }, 1, true, true);
+        ggml_vk_create_pipeline(device, device->pipeline_swiglu_q8_1_f32, "swiglu_q8_1_f32", swiglu_q8_1_f32_len, swiglu_q8_1_f32_data, "main", 4, sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1, true, true);
     }
     if (device->subgroup_clustered && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_subgroup_len, quantize_q8_1_x4_subgroup_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
@@ -11311,7 +11312,51 @@ void ggml_vk_xielu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_UNARY, std::move(p));
 }
 
+// [a770-opt] Decode-time split SWIGLU that also leaves dst quantized to q8_1_x4 in prealloc_y.
+static bool ggml_vk_try_swiglu_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0,
+                                    const ggml_tensor * src1, ggml_tensor * dst) {
+    static const bool disabled = getenv("GGML_VK_DISABLE_GLU_Q8_1") != nullptr;
+    vk_pipeline pipeline = ctx->device->pipeline_swiglu_q8_1_f32;
+    if (disabled || !pipeline || src1 == nullptr || ggml_get_glu_op(dst) != GGML_GLU_OP_SWIGLU) {
+        return false;
+    }
+    const int64_t ne = dst->ne[0];
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        ggml_nrows(dst) != 1 || ne % 128 != 0 ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    const size_t q_size = (size_t)(ne / 128) * 144;
+    if (!ctx->prealloc_y || ctx->prealloc_y->size < q_size) {
+        return false;
+    }
+    const vk_subbuffer s_a = ggml_vk_tensor_subbuffer(ctx, src0, true);
+    const vk_subbuffer s_b = ggml_vk_tensor_subbuffer(ctx, src1, true);
+    const vk_subbuffer s_d = ggml_vk_tensor_subbuffer(ctx, dst, true);
+    if (s_a.size != (size_t)ggml_nbytes(src0) || s_b.size != (size_t)ggml_nbytes(src1) || s_d.size != (size_t)ggml_nbytes(dst)) {
+        return false;
+    }
+    vk_pipeline to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
+    if (!to_q8_1) {
+        return false;
+    }
+    if (ctx->prealloc_y_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+    struct { uint32_t ne; } pc = { (uint32_t)ne };
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { s_a, s_b, s_d, ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) }, pc, { (uint32_t)ne, 1, 1 });
+    ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
+    ctx->prealloc_y_last_tensor_used = dst;
+    ctx->prealloc_y_last_k_padded = false;
+    ctx->prealloc_y_need_sync = true;
+    return true;
+}
+
 void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (ggml_vk_try_swiglu_q8_1(ctx, subctx, src0, src1, dst)) {
+        return;
+    }
     const float * op_params_f = (const float *)dst->op_params;
 
     const bool swapped = (bool)dst->op_params[1];

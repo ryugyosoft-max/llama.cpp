@@ -800,6 +800,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
     vk_pipeline pipeline_rms_norm_mul_q8_1_f32;
+    vk_pipeline pipeline_swiglu_q8_1_f32;
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
