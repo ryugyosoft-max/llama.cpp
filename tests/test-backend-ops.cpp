@@ -14163,6 +14163,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, m, 1, 4096, {1, 1}, {1, 1}));
         }
     }
+    // [a770-opt] model-shaped decode GEMVs (Qwen3.5-9B / LFM3-1.7B)
+    for (ggml_type ta : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (auto mk : std::vector<std::pair<int,int>>{{12288, 4096}, {4096, 12288}, {8192, 4096}, {2048, 8192}, {8192, 2048}}) {
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, mk.first, 1, mk.second, {1, 1}, {1, 1}));
+        }
+    }
 
     for (float n : {128.0f, 4096.0f, 32768.0f, 1048576.0f}) {
         test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, n, 1.0f));
