@@ -74,8 +74,102 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
     }
 }
 
+#if defined(DATA_A_Q4_K)
+// SB_LANE == 2 selects a coalesced decode path tuned for Intel Xe-HPG (A770), where the
+// default 16-values-per-thread split is latency bound.
+layout (constant_id = 3) const uint SB_LANE = 0;
+layout (binding = 0) readonly buffer A_U4_SB {uvec4 data_a_u4[];};
+layout (binding = 1) readonly buffer B_P128_SB {block_q8_1_x4_packed128 data_b_p128[];};
+
+// SB_LANE == 2: coalesced. Lanes walk each row as a flat array of 16-byte words
+// (9 per superblock), so every load instruction reads BLOCK_SIZE*16 contiguous bytes.
+// Word 0 of a superblock is the d/dmin/scales header (re-read through L1), words 1..8
+// hold 32 nibble bytes each = the low and high sub-block of one qs pair half.
+void compute_outputs_coal(const uint32_t first_row, const uint32_t num_rows) {
+    const uint tid = gl_LocalInvocationID.x;
+    get_offsets(a_offset, b_offset, d_offset);
+    const uint b_x4 = b_offset / 128;
+    const uint nsb = p.ncols / QUANT_K;
+    const uint nw = nsb * 9;
+
+    FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            temp[j][n] = FLOAT_TYPE(0.0f);
+        }
+    }
+
+    // UNR independent 16-byte words per lane in flight (loads issued before any math)
+    const uint UNR = 2;
+    for (uint g0 = tid; g0 < nw; g0 += BLOCK_SIZE * UNR) {
+        uvec4 q[UNR][NUM_ROWS];
+        uvec4 h[UNR][NUM_ROWS];
+        uint gg[UNR];
+        [[unroll]] for (uint u = 0; u < UNR; ++u) {
+            gg[u] = min(g0 + u * BLOCK_SIZE, nw - 1);
+            const uint blk = gg[u] / 9;
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                const uint row = first_row + min(n, num_rows - 1);
+                const uint rb = ((row * p.ncols) / QUANT_K + a_offset) * 9;
+                q[u][n] = data_a_u4[rb + gg[u]];
+                h[u][n] = data_a_u4[rb + blk * 9];
+            }
+        }
+        [[unroll]] for (uint u = 0; u < UNR; ++u) {
+            const uint g = g0 + u * BLOCK_SIZE;
+            const uint blk = gg[u] / 9;
+            const uint part = gg[u] - blk * 9;
+            if (g >= nw || part == 0) {
+                continue;
+            }
+            const uint pp = part - 1;
+            const uint pair = pp >> 1;
+            const uint half_ = pp & 1;
+            [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                const uint xb = b_x4 + (c * p.batch_stride_b) / 128 + blk * 2;
+                [[unroll]] for (uint hi = 0; hi < 2; ++hi) {
+                    const uint is = pair * 2 + hi;
+                    const uint yx = xb + (is >> 2);
+                    const uint jb = is & 3;
+                    const ivec4 yv = data_b_p128[yx].qs[jb * 2 + half_];
+                    const vec2 yds = vec2(data_b_p128[yx].ds[jb]);
+                    const uint sh = hi * 4;
+                    const uint scalesoffs = (is & 3) * 8;
+                    const uint scidx0 = (is < 4) ? 0 : 2;
+                    const uint scidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2;
+                    const uint mbidx0 = (is < 4) ? 1 : 2;
+                    const uint mbidxshift0 = (is < 4) ? scalesoffs : scalesoffs + 4;
+                    const uint mbidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2;
+                    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                        const uvec3 scales = h[u][n].yzw;
+                        const vec2 dm = unpackHalf2x16(h[u][n].x);
+                        const float sc = float(((scales[scidx0] >> scalesoffs) & 0xF) | ((scales[0] >> scidxshift1) & 0x30));
+                        const float mb = float(((scales[mbidx0] >> mbidxshift0) & 0xF) | ((scales[1] >> mbidxshift1) & 0x30));
+                        const uvec4 qq = q[u][n];
+                        int32_t q_sum = 0;
+                        q_sum += dotPacked4x8EXT(int32_t((qq.x >> sh) & 0x0F0F0F0F), yv.x);
+                        q_sum += dotPacked4x8EXT(int32_t((qq.y >> sh) & 0x0F0F0F0F), yv.y);
+                        q_sum += dotPacked4x8EXT(int32_t((qq.z >> sh) & 0x0F0F0F0F), yv.z);
+                        q_sum += dotPacked4x8EXT(int32_t((qq.w >> sh) & 0x0F0F0F0F), yv.w);
+                        temp[c][n] += FLOAT_TYPE(yds.x * dm.x * sc * float(q_sum) - (half_ == 0 ? dm.y * mb * yds.y : 0.0f));
+                    }
+                }
+            }
+        }
+    }
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+#endif
+
 void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     const uint tid = gl_LocalInvocationID.x;
+#if defined(DATA_A_Q4_K)
+    if (SB_LANE == 2) {
+        compute_outputs_coal(first_row, num_rows);
+        return;
+    }
+#endif
 
     get_offsets(a_offset, b_offset, d_offset);
     a_offset *= QUANT_K / QUANT_K_Q8_1;
