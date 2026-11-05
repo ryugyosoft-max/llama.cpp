@@ -15,6 +15,8 @@
 
 #include "fattn-xe1dec.hpp"
 
+#include <sycl/ext/oneapi/experimental/group_load_store.hpp>
+
 #include <cmath>
 #include <cstring>
 
@@ -35,12 +37,23 @@ struct xe1dec_params {
     float   scale;
 };
 
+// One subgroup block read: lane l receives dwords l, l + 8, l + 16, ... of the N * 8 dwords at p
+// (IGC turns plain 16-byte loads here into per-dword / per-halfword gathers).
+template <int N>
+static inline void xe1_block_load(const sycl::sub_group & sg, const char * p, uint32_t (&out)[N]) {
+    namespace exp = sycl::ext::oneapi::experimental;
+    auto gp = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::yes>(
+        (const uint32_t *) p);
+    exp::group_load(sg, gp, sycl::span<uint32_t, N>(out), exp::properties{ exp::data_placement_striped, exp::full_group });
+}
+
 template <int D, int GQA, int DS>
 static void xe1dec_kernel(const xe1dec_params p, const sycl::nd_item<3> & it, float * sh_s) {
     constexpr int R   = xe1_r<DS, GQA>();
     constexpr int DPL = D / (SG * DS);  // dims per lane
-    static_assert(DPL % 8 == 0, "a lane loads whole 16-byte groups");
-    constexpr int NV  = DPL / 8;        // 16-byte loads per lane per row
+    static_assert(DPL % 2 == 0, "a lane owns whole dwords");
+    constexpr int NW  = DPL / 2;        // dwords (half2) per lane per row
+    // striped layout: within a subgroup's D/DS-dim chunk, lane l owns dwords l + SG * c, c < NW
 
     const auto sg    = it.get_sub_group();
     const int  lane  = sg.get_local_linear_id();
@@ -52,14 +65,15 @@ static void xe1dec_kernel(const xe1dec_params p, const sycl::nd_item<3> & it, fl
     const int  kvh   = it.get_group(1);
     const int  iq3   = it.get_group(0);
     const int  head  = kvh * GQA + hsub;
-    const int  dim0  = dsub * (D / DS) + lane * DPL;
+    const int  cdim0 = dsub * (D / DS);  // first dim of the subgroup's chunk
 
-    sycl::half2 q[DPL / 2];
+    sycl::half2 q[NW];
     {
-        const float * qp = (const float *) (p.q + iq3 * p.nbq3 + head * p.nbq2) + dim0;
+        const float * qp = (const float *) (p.q + iq3 * p.nbq3 + head * p.nbq2) + cdim0;
 #pragma unroll
-        for (int i = 0; i < DPL / 2; ++i) {
-            q[i] = sycl::half2((sycl::half) (qp[2 * i] * p.scale), (sycl::half) (qp[2 * i + 1] * p.scale));
+        for (int c = 0; c < NW; ++c) {
+            const int d = 2 * (lane + SG * c);
+            q[c] = sycl::half2((sycl::half) (qp[d] * p.scale), (sycl::half) (qp[d + 1] * p.scale));
         }
     }
     float o[DPL];
@@ -76,8 +90,8 @@ static void xe1dec_kernel(const xe1dec_params p, const sycl::nd_item<3> & it, fl
     const int end     = sycl::min(p.KV, start + p.split_kv);
     const int n_steps = (end - start + T * R - 1) / (T * R);  // uniform over the workgroup
 
-    const char * kb = p.k + iq3 * p.nbk3 + kvh * p.nbk2 + dim0 * 2;
-    const char * vb = p.v + iq3 * p.nbv3 + kvh * p.nbv2 + dim0 * 2;
+    const char * kb = p.k + iq3 * p.nbk3 + kvh * p.nbk2 + cdim0 * 2;
+    const char * vb = p.v + iq3 * p.nbv3 + kvh * p.nbv2 + cdim0 * 2;
     const sycl::half * mb = p.m ? p.m + (iq3 % p.nem3) * p.m_batch : nullptr;
     const int sh_row = (rsub * GQA + hsub) * DS;
     // 32-bit row offsets: Alchemist has no native 64-bit integer multiply
@@ -86,29 +100,16 @@ static void xe1dec_kernel(const xe1dec_params p, const sycl::nd_item<3> & it, fl
     for (int st = 0; st < n_steps; ++st) {
         const int j = start + (st * R + rsub) * T;
 
-        // issue all K loads of the step first so they are in flight together
-        sycl::uint4 kraw[T][NV];
-#pragma unroll
-        for (int t = 0; t < T; ++t) {
-            const int tok = sycl::min(j + t, end - 1);
-            const sycl::uint4 * kr = (const sycl::uint4 *) (kb + (uint32_t) tok * nbk1);
-#pragma unroll
-            for (int i = 0; i < NV; ++i) {
-                kraw[t][i] = kr[i];
-            }
-        }
         float s[T];
 #pragma unroll
         for (int t = 0; t < T; ++t) {
+            const int tok = sycl::min(j + t, end - 1);
+            uint32_t kw[NW];
+            xe1_block_load<NW>(sg, kb + (uint32_t) tok * nbk1, kw);
             sycl::half2 a = sycl::half2(0.0f, 0.0f);
 #pragma unroll
-            for (int i = 0; i < NV; ++i) {
-                sycl::half2 kh[4];
-                *(sycl::uint4 *) kh = kraw[t][i];
-#pragma unroll
-                for (int c = 0; c < 4; ++c) {
-                    a = sycl::fma(kh[c], q[4 * i + c], a);
-                }
+            for (int c = 0; c < NW; ++c) {
+                a = sycl::fma(sycl::bit_cast<sycl::half2>(kw[c]), q[c], a);
             }
             s[t] = (float) a.x() + (float) a.y();
         }
@@ -159,16 +160,13 @@ static void xe1dec_kernel(const xe1dec_params p, const sycl::nd_item<3> & it, fl
         for (int t = 0; t < T; ++t) {
             const float pt  = sycl::select_from_group(sg, pr, t);
             const int   tok = sycl::min(j + t, end - 1);
-            const sycl::uint4 * vr = (const sycl::uint4 *) (vb + (uint32_t) tok * nbv1);
+            uint32_t vw[NW];
+            xe1_block_load<NW>(sg, vb + (uint32_t) tok * nbv1, vw);
 #pragma unroll
-            for (int i = 0; i < NV; ++i) {
-                sycl::half2 h[4];
-                *(sycl::uint4 *) h = vr[i];
-#pragma unroll
-                for (int c = 0; c < 4; ++c) {
-                    o[8 * i + 2 * c + 0] += pt * (float) h[c].x();
-                    o[8 * i + 2 * c + 1] += pt * (float) h[c].y();
-                }
+            for (int c = 0; c < NW; ++c) {
+                const sycl::half2 h = sycl::bit_cast<sycl::half2>(vw[c]);
+                o[2 * c + 0] += pt * (float) h.x();
+                o[2 * c + 1] += pt * (float) h.y();
             }
         }
     }
@@ -176,10 +174,10 @@ static void xe1dec_kernel(const xe1dec_params p, const sycl::nd_item<3> & it, fl
     const float l_sum = sycl::reduce_over_group(sg, l_lane, sycl::plus<float>());
 
     const int osplit = split * R + rsub;
-    float * op = p.part + ((int64_t) (osplit + p.k_num * iq3) * p.ne1 + head) * D + dim0;
+    float * op = p.part + ((int64_t) (osplit + p.k_num * iq3) * p.ne1 + head) * D + cdim0;
 #pragma unroll
-    for (int i = 0; i < DPL; i += 4) {
-        *(sycl::float4 *) (op + i) = sycl::float4(o[i], o[i + 1], o[i + 2], o[i + 3]);
+    for (int c = 0; c < NW; ++c) {
+        *(sycl::float2 *) (op + 2 * (lane + SG * c)) = sycl::float2(o[2 * c], o[2 * c + 1]);
     }
     if (lane == 0 && dsub == 0) {
         const int64_t n_o  = (int64_t) D * p.ne1 * p.k_num * it.get_group_range(0);

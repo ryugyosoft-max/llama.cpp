@@ -7908,7 +7908,10 @@ static float * ggml_sycl_ptq1_multi_slot(queue_ptr stream) {
 
 static bool ggml_sycl_try_ptq1_multi(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i,
                                      std::vector<uint8_t> & done, std::vector<const void *> & pending) {
-    static const bool on  = !getenv("GGML_SYCL_PTQ1_MULTI") || atoi(getenv("GGML_SYCL_PTQ1_MULTI")) != 0;
+    // [a770-opt] off by default on Arc Alchemist: its pairs core (NR 4, SIMD16 scalar loads, spills) loses to separate
+    // per-lane-block mat-vecs there (9B PTQ1_0 decode 82.4 -> 88.0 t/s, 27B 35.2 -> 36.3)
+    static const bool on  = getenv("GGML_SYCL_PTQ1_MULTI") ? atoi(getenv("GGML_SYCL_PTQ1_MULTI")) != 0
+                                                           : !ggml_sycl_device_is_alchemist(ctx.device);
     static int        log = getenv("GGML_SYCL_PTQ1_MULTI_LOG") ? atoi(getenv("GGML_SYCL_PTQ1_MULTI_LOG")) : 0;
     ggml_tensor * mm0 = cgraph->nodes[i];
     if (!on || !ggml_sycl_ptq1_multi_eligible(ctx, mm0)) {
