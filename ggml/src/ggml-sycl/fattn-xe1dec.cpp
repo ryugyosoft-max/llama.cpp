@@ -23,8 +23,7 @@ namespace {
 constexpr int SG = 8;  // subgroup size (DPAS-native SIMD8 on Alchemist)
 constexpr int T  = SG; // tokens per step
 
-template <int D> constexpr int xe1_ds() { return D == 256 ? 4 : 2; }
-template <int D, int GQA> constexpr int xe1_r() { return 16 / (GQA * xe1_ds<D>()) > 0 ? 16 / (GQA * xe1_ds<D>()) : 1; }
+template <int DS, int GQA> constexpr int xe1_r() { return 16 / (GQA * DS) > 0 ? 16 / (GQA * DS) : 1; }
 
 struct xe1dec_params {
     const char * q; const char * k; const char * v; const sycl::half * m;
@@ -36,10 +35,9 @@ struct xe1dec_params {
     float   scale;
 };
 
-template <int D, int GQA>
+template <int D, int GQA, int DS>
 static void xe1dec_kernel(const xe1dec_params p, const sycl::nd_item<3> & it, float * sh_s) {
-    constexpr int DS  = xe1_ds<D>();
-    constexpr int R   = xe1_r<D, GQA>();
+    constexpr int R   = xe1_r<DS, GQA>();
     constexpr int DPL = D / (SG * DS);  // dims per lane
     static_assert(DPL % 8 == 0, "a lane loads whole 16-byte groups");
     constexpr int NV  = DPL / 8;        // 16-byte loads per lane per row
@@ -82,20 +80,31 @@ static void xe1dec_kernel(const xe1dec_params p, const sycl::nd_item<3> & it, fl
     const char * vb = p.v + iq3 * p.nbv3 + kvh * p.nbv2 + dim0 * 2;
     const sycl::half * mb = p.m ? p.m + (iq3 % p.nem3) * p.m_batch : nullptr;
     const int sh_row = (rsub * GQA + hsub) * DS;
+    // 32-bit row offsets: Alchemist has no native 64-bit integer multiply
+    const uint32_t nbk1 = (uint32_t) p.nbk1, nbv1 = (uint32_t) p.nbv1;
 
     for (int st = 0; st < n_steps; ++st) {
         const int j = start + (st * R + rsub) * T;
 
-        float s[T];
+        // issue all K loads of the step first so they are in flight together
+        sycl::uint4 kraw[T][NV];
 #pragma unroll
         for (int t = 0; t < T; ++t) {
             const int tok = sycl::min(j + t, end - 1);
-            const sycl::uint4 * kr = (const sycl::uint4 *) (kb + (int64_t) tok * p.nbk1);
+            const sycl::uint4 * kr = (const sycl::uint4 *) (kb + (uint32_t) tok * nbk1);
+#pragma unroll
+            for (int i = 0; i < NV; ++i) {
+                kraw[t][i] = kr[i];
+            }
+        }
+        float s[T];
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
             sycl::half2 a = sycl::half2(0.0f, 0.0f);
 #pragma unroll
             for (int i = 0; i < NV; ++i) {
                 sycl::half2 kh[4];
-                *(sycl::uint4 *) kh = kr[i];
+                *(sycl::uint4 *) kh = kraw[t][i];
 #pragma unroll
                 for (int c = 0; c < 4; ++c) {
                     a = sycl::fma(kh[c], q[4 * i + c], a);
@@ -136,8 +145,8 @@ static void xe1dec_kernel(const xe1dec_params p, const sycl::nd_item<3> & it, fl
         }
 
         const float m_new = sycl::max(m_run, sycl::reduce_over_group(sg, score, sycl::maximum<float>()));
-        const float alpha = sycl::exp(m_run - m_new);
-        const float pr    = sycl::exp(score - m_new);
+        const float alpha = sycl::native::exp(m_run - m_new);
+        const float pr    = sycl::native::exp(score - m_new);
         m_run  = m_new;
         l_lane = l_lane * alpha + pr;
 
@@ -150,7 +159,7 @@ static void xe1dec_kernel(const xe1dec_params p, const sycl::nd_item<3> & it, fl
         for (int t = 0; t < T; ++t) {
             const float pt  = sycl::select_from_group(sg, pr, t);
             const int   tok = sycl::min(j + t, end - 1);
-            const sycl::uint4 * vr = (const sycl::uint4 *) (vb + (int64_t) tok * p.nbv1);
+            const sycl::uint4 * vr = (const sycl::uint4 *) (vb + (uint32_t) tok * nbv1);
 #pragma unroll
             for (int i = 0; i < NV; ++i) {
                 sycl::half2 h[4];
@@ -241,38 +250,41 @@ static void xe1dec_reduce(const float * part, const float * sinks, float * dst, 
     dst[(int64_t) i3 * ne2 * ne1 * D + (int64_t) D * n + d] = sycl::clamp(O, -3.402823466e+38f, 3.402823466e+38f);
 }
 
-template <int D, int GQA>
+template <int D, int GQA, int DS>
 static void launch(const xe1dec_params & p, int nkvh, int ne3, int wgs, dpct::queue_ptr stream) {
-    constexpr int DS = xe1_ds<D>();
-    constexpr int R  = xe1_r<D, GQA>();
+    constexpr int R  = xe1_r<DS, GQA>();
     constexpr int WG = SG * GQA * DS * R;
     constexpr int SH = DS > 1 ? 2 * R * GQA * DS * T : 1;
     stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<float, 1> sh(sycl::range<1>(SH), cgh);
         cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(ne3, nkvh, (size_t) wgs * WG), sycl::range<3>(1, 1, WG)),
                          [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(SG)]] {
-                             xe1dec_kernel<D, GQA>(p, it, sh.get_multi_ptr<sycl::access::decorated::no>().get());
+                             xe1dec_kernel<D, GQA, DS>(p, it, sh.get_multi_ptr<sycl::access::decorated::no>().get());
                          });
     });
 }
 
-template <int D>
+template <int D, int DS>
 static void launch_gqa(int gqa, const xe1dec_params & p, int nkvh, int ne3, int wgs, dpct::queue_ptr stream) {
     switch (gqa) {
-        case 2: launch<D, 2>(p, nkvh, ne3, wgs, stream); break;
-        case 3: launch<D, 3>(p, nkvh, ne3, wgs, stream); break;
-        case 4: launch<D, 4>(p, nkvh, ne3, wgs, stream); break;
-        case 5: launch<D, 5>(p, nkvh, ne3, wgs, stream); break;
-        case 6: launch<D, 6>(p, nkvh, ne3, wgs, stream); break;
-        case 7: launch<D, 7>(p, nkvh, ne3, wgs, stream); break;
-        case 8: launch<D, 8>(p, nkvh, ne3, wgs, stream); break;
+        case 2: launch<D, 2, DS>(p, nkvh, ne3, wgs, stream); break;
+        case 3: launch<D, 3, DS>(p, nkvh, ne3, wgs, stream); break;
+        case 4: launch<D, 4, DS>(p, nkvh, ne3, wgs, stream); break;
+        case 5: launch<D, 5, DS>(p, nkvh, ne3, wgs, stream); break;
+        case 6: launch<D, 6, DS>(p, nkvh, ne3, wgs, stream); break;
+        case 7: launch<D, 7, DS>(p, nkvh, ne3, wgs, stream); break;
+        case 8: launch<D, 8, DS>(p, nkvh, ne3, wgs, stream); break;
         default: GGML_ABORT("xe1dec: unsupported GQA %d", gqa);
     }
 }
 
+static int xe1dec_ds(int D) {
+    static const int ds256 = getenv("GGML_SYCL_XE1DEC_DS256") ? atoi(getenv("GGML_SYCL_XE1DEC_DS256")) : 4;
+    return D == 256 ? (ds256 == 2 ? 2 : 4) : 2;
+}
+
 static int xe1dec_r(int D, int gqa) {
-    const int ds = D == 256 ? 4 : 2;
-    return std::max(1, 16 / (gqa * ds));
+    return std::max(1, 16 / (gqa * xe1dec_ds(D)));
 }
 
 }  // namespace
@@ -353,12 +365,22 @@ void ggml_sycl_flash_attn_ext_xe1dec(ggml_backend_sycl_context & ctx, ggml_tenso
     p.nem3 = mask ? (int) std::max<int64_t>(1, mask->ne[3]) : 1;
     p.KV = KV; p.split_kv = split_kv; p.k_num = k_num; p.ne1 = ne1; p.scale = scale;
 
-    if (D == 256) {
-        launch_gqa<256>(gqa, p, nkvh, ne3, wgs, stream);
+    if (getenv("GGML_SYCL_XE1DEC_DBG") && atoi(getenv("GGML_SYCL_XE1DEC_DBG")) == 2) {
+        // timing only: merge without the partial kernel
+    } else if (D == 256) {
+        if (xe1dec_ds(256) == 2) {
+            launch_gqa<256, 2>(gqa, p, nkvh, ne3, wgs, stream);
+        } else {
+            launch_gqa<256, 4>(gqa, p, nkvh, ne3, wgs, stream);
+        }
     } else {
-        launch_gqa<128>(gqa, p, nkvh, ne3, wgs, stream);
+        launch_gqa<128, 2>(gqa, p, nkvh, ne3, wgs, stream);
     }
 
+    static const int dbg = getenv("GGML_SYCL_XE1DEC_DBG") ? atoi(getenv("GGML_SYCL_XE1DEC_DBG")) : 0;
+    if (dbg == 1) {
+        return;  // timing only: skip the merge
+    }
     const float * pp = part.get();
     const float * sk = sinks ? (const float *) sinks->data : nullptr;
     float *       dd = (float *) dst->data;

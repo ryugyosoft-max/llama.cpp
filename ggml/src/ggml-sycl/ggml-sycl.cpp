@@ -7036,6 +7036,16 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             ggml_sycl_acc(ctx, dst);
             break;
         case GGML_OP_MUL:
+            if (getenv("GGML_SYCL_MUL_LOG")) {  // [a770-opt] which MULs run standalone
+                static int n = 0;
+                if (n < 400) {
+                    ++n;
+                    const ggml_tensor * a = dst->src[0], * b = dst->src[1];
+                    fprintf(stderr, "MUL %s: a=%s(%s %lldx%lldx%lld) b=%s(%s %lldx%lldx%lld)\n", dst->name, a->name, ggml_op_name(a->op),
+                            (long long) a->ne[0], (long long) a->ne[1], (long long) a->ne[2], b->name, ggml_op_name(b->op),
+                            (long long) b->ne[0], (long long) b->ne[1], (long long) b->ne[2]);
+                }
+            }
             ggml_sycl_mul(ctx, dst);
             break;
         case GGML_OP_LOG:
