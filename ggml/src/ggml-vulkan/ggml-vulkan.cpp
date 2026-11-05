@@ -1881,6 +1881,24 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
         }
 
+        // [a770-opt] GGML_VK_CM_TILE_{L,M,S}="threads,BM,BN,BK,WM,WN,WMITER,SG" overrides the coopmat1 float/quant tiles (measurement)
+        if (device->coopmat_support && !device->coopmat2) {
+            auto tile_env = [&](const char * name, std::vector<uint32_t> & wt, std::vector<uint32_t> & wtq,
+                                std::array<uint32_t, 3> & den, std::array<uint32_t, 3> & denq, uint32_t & align) {
+                const char * e = getenv(name);
+                if (!e) return;
+                uint32_t v[8];
+                if (sscanf(e, "%u,%u,%u,%u,%u,%u,%u,%u", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]) != 8) return;
+                wtq = { v[0], v[1], v[2], v[3], v[4], v[5], v[6], device->coopmat_m, device->coopmat_n, device->coopmat_k, v[7] };
+                wt  = { v[0], v[1], v[2], 16,   v[4], v[5], v[6], device->coopmat_m, device->coopmat_n, device->coopmat_k, v[7] };
+                den = denq = { v[1], v[2], 1 };
+                align = std::min(align, v[3]);
+            };
+            tile_env("GGML_VK_CM_TILE_L", l_warptile, l_warptile_mmq, l_wg_denoms, l_mmq_wg_denoms, l_align);
+            tile_env("GGML_VK_CM_TILE_M", m_warptile, m_warptile_mmq, m_wg_denoms, m_mmq_wg_denoms, m_align);
+            tile_env("GGML_VK_CM_TILE_S", s_warptile, s_warptile_mmq, s_wg_denoms, s_mmq_wg_denoms, s_align);
+        }
+
         const bool use_cm1_int = device->coopmat_int_support &&
                                  (device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4);
 
