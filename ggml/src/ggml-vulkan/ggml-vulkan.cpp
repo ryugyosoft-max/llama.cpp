@@ -16843,6 +16843,10 @@ bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDeviceProperties& 
     switch (props.vendorID) {
     case VK_VENDOR_ID_INTEL:
         // Only allowing Xe2/Xe3 GPU and integrated Xe GPUs at the moment since older hardware (ex. Arc A770) has performance regressions.
+        // [a770-opt] GGML_VK_FORCE_COOPMAT_XE1=1 enables XMX on discrete Xe-HPG (Arc A770) for measurement
+        if (arch == vk_device_architecture::INTEL_XE1 && getenv("GGML_VK_FORCE_COOPMAT_XE1")) {
+            return true;
+        }
         return (arch == vk_device_architecture::INTEL_XE2) ||
             (arch == vk_device_architecture::INTEL_XE1 && props.deviceType == vk::PhysicalDeviceType::eIntegratedGpu && driver_props.driverID == vk::DriverId::eIntelProprietaryWindows);
     case VK_VENDOR_ID_AMD:
