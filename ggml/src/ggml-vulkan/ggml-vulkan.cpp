@@ -1678,6 +1678,19 @@ static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type
 #endif
 }
 
+// [a770-opt] packed A tiles in shared memory (8x16 per coopmat tile): Intel's Windows driver,
+// and Mesa ANV on discrete Xe-HPG where they become block loads (GGML_VK_XE1_NO_SLM_RESHAPE=1 disables)
+static bool ggml_vk_intel_slm_a_reshape(const vk_device & device) {
+    if (device->vendor_id != VK_VENDOR_ID_INTEL || !device->coopmat_support) {
+        return false;
+    }
+    if (device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
+        return true;
+    }
+    return device->architecture == vk_device_architecture::INTEL_XE1 && device->driver_id == vk::DriverId::eIntelOpenSourceMESA &&
+           !getenv("GGML_VK_XE1_NO_SLM_RESHAPE");
+}
+
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
@@ -1870,7 +1883,20 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support) {
             // Xe1/Xe2/Xe3 with coopmat enabled - warptile performance tuning
             l_warptile = { 512, 128, 128, 16, mm_warp_8, 32, 2, tm_l, tn_l, tk_l, mm_warp_8 };
-            if (device->architecture == INTEL_XE1) {
+            if (device->architecture == INTEL_XE1 && device->driver_id == vk::DriverId::eIntelOpenSourceMESA) {
+                // [a770-opt] DG2 has 128 32-byte GRFs: a 8x8 f32 accumulator costs 8 GRFs, so keep 2x2 per
+                // subgroup (SIMD8, DPAS-native) and get the reuse from 64 subgroups per workgroup
+                l_warptile      = { 512, 128, 128, 16, 16, 16, 1, tm_l, tn_l, tk_l, 8 };
+                l_warptile_mmq  = { 512, 128, 128, 32, 16, 16, 1, tm_l, tn_l, tk_l, 8 };
+                m_warptile      = { 128,  64,  64, 16, 16, 16, 1, tm_m, tn_m, tk_m, 8 };
+                m_warptile_mmq  = { 128,  64,  64, 32, 16, 16, 1, tm_m, tn_m, tk_m, 8 };
+                s_warptile      = {  32,  32,  32, 16, 16, 16, 1, tm_s, tn_s, tk_s, 8 };
+                s_warptile_mmq  = {  32,  32,  32, 32, 16, 16, 1, tm_s, tn_s, tk_s, 8 };
+                l_wg_denoms = l_mmq_wg_denoms = { 128, 128, 1 };
+                m_wg_denoms = m_mmq_wg_denoms = {  64,  64, 1 };
+                s_wg_denoms = s_mmq_wg_denoms = {  32,  32, 1 };
+                l_align = m_align = s_align = 32;
+            } else if (device->architecture == INTEL_XE1) {
                 l_warptile_mmq  = { 512, 256, 128, 32, 32, 32, 2, tm_l, tn_l, tk_l, 16 };
                 l_mmq_wg_denoms = { 256, 128, 1 };
                 l_align         = 32;  //set as BK
@@ -2180,8 +2206,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     auto const &ggml_vk_mul_mm_spec = [&device](std::vector<uint32_t> spec, bool aligned) {
         spec.push_back(aligned ? 1u : 0u);  // constantID=11: ALIGNED
-        if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
-            device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
+        if (ggml_vk_intel_slm_a_reshape(device)) {
             spec.push_back(0u);  // constantID=12: SHMEM_STRIDE_PAD = 0
             spec.push_back(1u);  // constantID=13: APPLY_SLM_A_RESHAPE = true
         }
@@ -2191,8 +2216,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     auto const &ggml_vk_mul_mm_spec_quant = [&device](std::vector<uint32_t> spec, bool aligned, uint32_t type) {
         spec.push_back(aligned ? 1u : 0u);  // constantID=11: ALIGNED
         spec.push_back(type);               // constantID=12: MmTypeA
-        if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
-            device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
+        if (ggml_vk_intel_slm_a_reshape(device)) {
             spec.push_back(0u);  // constantID=13: SHMEM_STRIDE_PAD = 0
             spec.push_back(1u);  // constantID=14: APPLY_SLM_A_RESHAPE = true
         }
@@ -2297,6 +2321,21 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     std::vector<vk_tile_config> tc_mm = {{s_warptile, s_wg_denoms, s_align}, {m_warptile, m_wg_denoms, m_align}, {l_warptile, l_wg_denoms, l_align}};
     std::vector<vk_tile_config> tc_mmq = {{s_warptile_mmq, s_mmq_wg_denoms, s_align}, {m_warptile_mmq, m_mmq_wg_denoms, m_align}, {l_warptile_mmq, l_mmq_wg_denoms, l_align}};
 
+    // [a770-opt] with XMX on discrete Xe-HPG + Mesa, the integer-dot MMQ kernels still win for
+    // 4/5/6-bit quants (q4_0 17 vs 14 TFLOPS); XMX wins for f16, q8_0, q2_0 and the PrismML types
+#if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+    const bool cm2_pipelines_created = device->coopmat2;
+#else
+    const bool cm2_pipelines_created = false;
+#endif
+#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    const bool cm1_pipelines_created = !cm2_pipelines_created && device->coopmat_support;
+#else
+    const bool cm1_pipelines_created = false;
+#endif
+    const bool xe1_xmx_hybrid = cm1_pipelines_created && device->vendor_id == VK_VENDOR_ID_INTEL &&
+                                device->architecture == INTEL_XE1 && device->driver_id == vk::DriverId::eIntelOpenSourceMESA &&
+                                !getenv("GGML_VK_XE1_XMX_ALL");
 #if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
     if (device->coopmat2) {
         auto const &ggml_vk_mul_mm_cm2_spec = [&](std::vector<uint32_t> spec, bool aligned, uint32_t type = UINT32_MAX) {
@@ -2600,8 +2639,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             cm1_create_mmq({GGML_TYPE_Q6_K,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int_k, "matmul_id_subgroup_q6_k_q8_1",   matmul_id_subgroup_q6_k_q8_1_cm1_len,   matmul_id_subgroup_q6_k_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_NVFP4, GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int_k, "matmul_id_subgroup_nvfp4_q8_1",  matmul_id_subgroup_nvfp4_q8_1_cm1_len,  matmul_id_subgroup_nvfp4_q8_1_cm1_data,  sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); }
         }
-    } else
+    }
 #endif  // defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    if (!cm2_pipelines_created && (!cm1_pipelines_created || xe1_xmx_hybrid))
     {
         // Helper for subgroup path with dot2 selection and filtering
         auto sg_create = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,
@@ -2636,6 +2676,27 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         std::vector<vk_tile_config> tc_id = {{s_warptile_id, s_wg_denoms, s_align}, {m_warptile_id, m_wg_denoms, m_align}, {l_warptile_id, l_wg_denoms, l_align}};
         std::vector<vk_tile_config> tc_mmqid = {{s_warptile_mmqid, s_mmq_wg_denoms, s_align}, {m_warptile_mmqid, m_mmq_wg_denoms, m_align}, {l_warptile_mmqid, l_mmq_wg_denoms, l_align}};
 
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+        if (xe1_xmx_hybrid && device->integer_dot_product) {
+            std::vector<vk_tile_config> tc_mmq_int = {{s_warptile_mmq_int, s_mmq_wg_denoms, s_align}, {m_warptile_mmq_int, m_mmq_wg_denoms, m_align}, {l_warptile_mmq_int, l_mmq_wg_denoms, l_align}};
+            std::vector<vk_tile_config> tc_mmq_int_k = {{s_warptile_mmq_int_k, s_mmq_wg_denoms, s_align}, {m_warptile_mmq_int_k, m_mmq_wg_denoms, m_align}, {l_warptile_mmq_int_k, l_mmq_wg_denoms, l_align}};
+            sg_create_mmq({GGML_TYPE_Q4_0, GGML_TYPE_Q8_1, false, false}, tc_mmq_int, "matmul_q4_0_q8_1", matmul_q4_0_q8_1_len, matmul_q4_0_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
+            sg_create_mmq({GGML_TYPE_Q4_1, GGML_TYPE_Q8_1, false, false}, tc_mmq_int, "matmul_q4_1_q8_1", matmul_q4_1_q8_1_len, matmul_q4_1_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
+            sg_create_mmq({GGML_TYPE_Q5_0, GGML_TYPE_Q8_1, false, false}, tc_mmq_int, "matmul_q5_0_q8_1", matmul_q5_0_q8_1_len, matmul_q5_0_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
+            sg_create_mmq({GGML_TYPE_Q5_1, GGML_TYPE_Q8_1, false, false}, tc_mmq_int, "matmul_q5_1_q8_1", matmul_q5_1_q8_1_len, matmul_q5_1_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
+            sg_create_mmq({GGML_TYPE_MXFP4, GGML_TYPE_Q8_1, false, false}, tc_mmq_int, "matmul_mxfp4_q8_1", matmul_mxfp4_q8_1_len, matmul_mxfp4_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
+            sg_create_mmq({GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_1, false, false}, tc_mmq_int, "matmul_iq4_xs_q8_1", matmul_iq4_xs_q8_1_len, matmul_iq4_xs_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
+            sg_create_mmq({GGML_TYPE_Q2_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_int_k, "matmul_q2_k_q8_1", matmul_q2_k_q8_1_len, matmul_q2_k_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
+            sg_create_mmq({GGML_TYPE_Q3_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_int_k, "matmul_q3_k_q8_1", matmul_q3_k_q8_1_len, matmul_q3_k_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
+            sg_create_mmq({GGML_TYPE_Q4_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_int_k, "matmul_q4_k_q8_1", matmul_q4_k_q8_1_len, matmul_q4_k_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
+            sg_create_mmq({GGML_TYPE_Q5_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_int_k, "matmul_q5_k_q8_1", matmul_q5_k_q8_1_len, matmul_q5_k_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
+            sg_create_mmq({GGML_TYPE_Q6_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_int_k, "matmul_q6_k_q8_1", matmul_q6_k_q8_1_len, matmul_q6_k_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
+            sg_create_mmq({GGML_TYPE_IQ3_S, GGML_TYPE_Q8_1, false, false}, tc_mmq_int_k, "matmul_iq3_s_q8_1", matmul_iq3_s_q8_1_len, matmul_iq3_s_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
+        } else
+#endif
+        if (xe1_xmx_hybrid) {
+            // nothing else to add next to the coopmat pipelines
+        } else
         if (device->fp16) {
             // FP16 subgroup path - with dot2 runtime selection
             #define SPV_DOT2(NAME) (device->dot2_f16 ? NAME ## _dot2_len : NAME ## _len), (device->dot2_f16 ? NAME ## _dot2_data : NAME ## _data)
@@ -5031,6 +5092,12 @@ vk_device ggml_vk_get_device(size_t idx) {
             device->mul_mat_m_int[i]    = device->mul_mat_m[i];
             device->mul_mat_s_int[i]    = device->mul_mat_s[i];
             device->mul_mat_id_l_int[i] = device->mul_mat_id_l[i];
+            if (device->vendor_id == VK_VENDOR_ID_INTEL && device->architecture == vk_device_architecture::INTEL_XE1 &&
+                device->driver_id == vk::DriverId::eIntelOpenSourceMESA) {
+                // [a770-opt] the large tile is enabled for the XMX pipelines; the integer-dot MMQ
+                // kernels (kept next to them for 4/5/6-bit quants) are still fastest at the medium tile
+                device->mul_mat_l_int[i] = false;
+            }
             device->mul_mat_id_m_int[i] = device->mul_mat_id_m[i];
             device->mul_mat_id_s_int[i] = device->mul_mat_id_s[i];
         }
@@ -16861,8 +16928,9 @@ bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDeviceProperties& 
     switch (props.vendorID) {
     case VK_VENDOR_ID_INTEL:
         // Only allowing Xe2/Xe3 GPU and integrated Xe GPUs at the moment since older hardware (ex. Arc A770) has performance regressions.
-        // [a770-opt] GGML_VK_FORCE_COOPMAT_XE1=1 enables XMX on discrete Xe-HPG (Arc A770) for measurement
-        if (arch == vk_device_architecture::INTEL_XE1 && getenv("GGML_VK_FORCE_COOPMAT_XE1")) {
+        // [a770-opt] GGML_VK_XE1_XMX=1 (alias GGML_VK_FORCE_COOPMAT_XE1) enables XMX on discrete Xe-HPG (Arc A770).
+        // Worth it with the a770-xmx Mesa (block loads, in-place DPAS, relaxed SLM scheduling).
+        if (arch == vk_device_architecture::INTEL_XE1 && (getenv("GGML_VK_XE1_XMX") || getenv("GGML_VK_FORCE_COOPMAT_XE1"))) {
             return true;
         }
         return (arch == vk_device_architecture::INTEL_XE2) ||
