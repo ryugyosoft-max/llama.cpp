@@ -3021,8 +3021,41 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_q8_1_f32", arr_dmmv_q2_0_q8_1_f32_len[reduc], arr_dmmv_q2_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(2*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(2*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                 // PTQ1_0: 4 rows per workgroup; the 4th constant is the column group size of the multi-column path
-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_PTQ1_0][i], "mul_mat_vec_ptq1_0_q8_1_f32", arr_dmmv_ptq1_0_q8_1_f32_len[reduc], arr_dmmv_ptq1_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {4*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 4*rm_kq_int, i+1, 3}, 1, true, use_subgroups, subgroup_size_int);
-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_PQ2_0][i], "mul_mat_vec_pq2_0_q8_1_f32", arr_dmmv_pq2_0_q8_1_f32_len[reduc], arr_dmmv_pq2_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(2*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(2*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+                {
+                    // [a770-opt] tunable on Xe-HPG: subgroup width, subgroups per workgroup, rows per workgroup
+                    uint32_t ptq_sg = subgroup_size_int, ptq_wg = wg_size_subgroup_int, ptq_rows = 4*rm_kq_int;
+                    shader_reduction_mode ptq_reduc = reduc;
+                    if (device->vendor_id == VK_VENDOR_ID_INTEL && device->architecture == INTEL_XE1 && device->subgroup_size_control) {
+                        static const uint32_t e_sg   = getenv("GGML_VK_PTQ_SG")   ? atoi(getenv("GGML_VK_PTQ_SG"))   : 0;
+                        static const uint32_t e_wgm  = getenv("GGML_VK_PTQ_WGM")  ? atoi(getenv("GGML_VK_PTQ_WGM"))  : 0;
+                        static const uint32_t e_rows = getenv("GGML_VK_PTQ_ROWS") ? atoi(getenv("GGML_VK_PTQ_ROWS")) : 0;
+                        // measured on A770 (Bonsai 2 27B PTQ1_0 decode): 2 rows per 8-lane workgroup instead of 4
+                        // (twice the workgroups, better latency hiding): 25.8 -> 29.0 t/s. Extra subgroups per
+                        // workgroup were slower once their partial sums go through shared memory.
+                        ptq_sg   = e_sg ? e_sg : 8;
+                        ptq_wg   = ptq_sg * (e_wgm ? e_wgm : 1);
+                        ptq_rows = e_rows ? e_rows : 2;
+                        // several subgroups per workgroup: the partial sums must go through shared memory
+                        if (ptq_wg > ptq_sg && use_subgroups) {
+                            ptq_reduc = SHADER_REDUCTION_MODE_HYBRID;
+                        }
+                    }
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_PTQ1_0][i], "mul_mat_vec_ptq1_0_q8_1_f32", arr_dmmv_ptq1_0_q8_1_f32_len[ptq_reduc], arr_dmmv_ptq1_0_q8_1_f32_data[ptq_reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {ptq_rows, 1, 1}, {ptq_wg, ptq_rows, i+1, 3}, 1, true, use_subgroups, ptq_sg);
+                }
+                {
+                    uint32_t pq_sg = subgroup_size_int, pq_wg = wg_size_subgroup_int, pq_rows = rm_int_n(2*rm_kq_int, i);
+                    shader_reduction_mode pq_reduc = reduc;
+                    if (device->vendor_id == VK_VENDOR_ID_INTEL && device->architecture == INTEL_XE1 && device->subgroup_size_control) {
+                        static const uint32_t e_sg   = getenv("GGML_VK_PQ2_SG")   ? atoi(getenv("GGML_VK_PQ2_SG"))   : 0;
+                        static const uint32_t e_wgm  = getenv("GGML_VK_PQ2_WGM")  ? atoi(getenv("GGML_VK_PQ2_WGM"))  : 0;
+                        static const uint32_t e_rows = getenv("GGML_VK_PQ2_ROWS") ? atoi(getenv("GGML_VK_PQ2_ROWS")) : 0;
+                        if (e_sg)   { pq_sg = e_sg; }
+                        pq_wg = pq_sg * (e_wgm ? e_wgm : (w == DMMV_WG_SIZE_SUBGROUP ? 1 : 4));
+                        if (pq_wg > pq_sg && use_subgroups) { pq_reduc = SHADER_REDUCTION_MODE_HYBRID; }
+                        if (e_rows) { pq_rows = e_rows; }
+                    }
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_PQ2_0][i], "mul_mat_vec_pq2_0_q8_1_f32", arr_dmmv_pq2_0_q8_1_f32_len[pq_reduc], arr_dmmv_pq2_0_q8_1_f32_data[pq_reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {pq_rows, 1, 1}, {pq_wg, pq_rows, i+1}, 1, true, use_subgroups, pq_sg);
+                }
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_q8_1_f32", arr_dmmv_q4_0_q8_1_f32_len[reduc], arr_dmmv_q4_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_1][i], "mul_mat_vec_q4_1_q8_1_f32", arr_dmmv_q4_1_q8_1_f32_len[reduc], arr_dmmv_q4_1_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_0][i], "mul_mat_vec_q5_0_q8_1_f32", arr_dmmv_q5_0_q8_1_f32_len[reduc], arr_dmmv_q5_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
