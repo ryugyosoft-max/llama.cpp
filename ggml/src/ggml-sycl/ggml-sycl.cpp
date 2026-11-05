@@ -106,6 +106,7 @@
 #include "ggml-sycl/gated_delta_net.hpp"
 #include "ggml-sycl/pool.hpp"
 #include "ggml-sycl/cross_entropy_loss.hpp"
+#include "ggml-sycl/fattn-xe1dec.hpp"
 
 #define MEM_SIZE_2M	0x00200000
 #define MEM_SIZE_1G	0x40000000
@@ -485,7 +486,8 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_quant_f16_gemm = ggml_sycl_get_env("GGML_SYCL_QUANT_F16_GEMM", 1);
         g_ggml_sycl_quant_s4_gemm = ggml_sycl_get_env("GGML_SYCL_QUANT_S4_GEMM", 1);
         g_ggml_sycl_quant_w8a8 = ggml_sycl_get_env("GGML_SYCL_QUANT_W8A8", 1);
-        g_ggml_sycl_enable_graph = ggml_sycl_get_env("GGML_SYCL_ENABLE_GRAPH", 0);
+        // [a770-opt] -1 = auto: on for Arc Alchemist (decode graphs replay; 9B PTQ1_0 59 -> 68 t/s), off elsewhere
+        g_ggml_sycl_enable_graph = ggml_sycl_get_env("GGML_SYCL_ENABLE_GRAPH", -1);
         g_ggml_sycl_enable_dnn = ggml_sycl_get_env("GGML_SYCL_ENABLE_DNN", 1);
         g_ggml_sycl_fa_onednn = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN", 1);
         g_ggml_sycl_fa_onednn_max_kv = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_MAX_KV", 0);
@@ -870,6 +872,7 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
             case GGML_TYPE_IQ3_XXS:
             case GGML_TYPE_IQ3_S:
             case GGML_TYPE_PQ2_0:
+            case GGML_TYPE_Q2_0:
             case GGML_TYPE_PTQ1_0:
             case GGML_TYPE_MXFP4:{
                 ggml_tensor_extra_gpu * extra = new ggml_tensor_extra_gpu{};
@@ -4721,6 +4724,7 @@ inline bool ggml_sycl_supports_reorder_mmvq(enum ggml_type type) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_PQ2_0:
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_PTQ1_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q2_K:
@@ -4982,6 +4986,45 @@ static bool reorder_qw_pq2_0(uint8_t * data_device, const int ncols, const int n
 
             for (int j = 0; j < QK_PQ2_0 / 4; j++) {
                 *(qs_ptr + ib * QK_PQ2_0 / 4 + j) = x[ib].qs[j];
+            }
+            *(d_ptr + ib) = x[ib].d;
+        });
+    if (!g_ggml_sycl_use_async_mem_op) {
+        reorder_event.wait_and_throw();
+    }
+    return true;
+}
+
+// [a770-opt] Q2_0 reorder (copied from PQ2_0)
+static bool reorder_qw_q2_0(uint8_t * data_device, const int ncols, const int nrows, size_t size, size_t offset,
+                             dpct::queue_ptr stream) {
+    sycl_reorder_temp_buffer tmp(stream, size);
+    if (!tmp) {
+        GGML_LOG_WARN("%s: failed to allocate %zu bytes for reorder temp buffer, skipping reorder\n", __func__, size);
+        return false;
+    }
+    uint8_t * tmp_buf = static_cast<uint8_t *>(tmp.ptr);
+
+    sycl::event copy_event;
+    SYCL_CHECK(CHECK_TRY_ERROR(copy_event = stream->memcpy(tmp_buf, data_device, size)));
+    if (!g_ggml_sycl_use_async_mem_op) {
+        copy_event.wait();
+    }
+
+    GGML_ASSERT((size % sizeof(block_q2_0) == 0));
+    GGML_ASSERT((offset % sizeof(block_q2_0) == 0));
+    int offset_blks = offset / sizeof(block_q2_0);
+    auto qs_ptr     = data_device + offset_blks * QK2_0 / 4;
+    auto d_ptr      = (sycl::half *) (qs_ptr + ncols * nrows / 4) + offset_blks;
+
+    auto reorder_event = stream->parallel_for(
+        size / sizeof(block_q2_0),
+            [=](auto i) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            const block_q2_0 * x = (const block_q2_0 *) tmp_buf;
+            const int ib = i;
+
+            for (int j = 0; j < QK2_0 / 4; j++) {
+                *(qs_ptr + ib * QK2_0 / 4 + j) = x[ib].qs[j];
             }
             *(d_ptr + ib) = x[ib].d;
         });
@@ -5653,6 +5696,8 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
             return reorder_qw_q8_0(data_device, ncols, nrows, size, 0, stream);
         case GGML_TYPE_PQ2_0:
             return reorder_qw_pq2_0(data_device, ncols, nrows, size, 0, stream);
+        case GGML_TYPE_Q2_0:
+            return reorder_qw_q2_0(data_device, ncols, nrows, size, 0, stream);
         case GGML_TYPE_PTQ1_0:
             return reorder_qw_ptq1_0(data_device, size, stream);
         case GGML_TYPE_Q2_K:
@@ -7502,7 +7547,8 @@ struct sycl_op_timing {
     double total = 0;
     std::map<std::string, std::pair<double, long>> per_op;
     static bool draft_sized(const ggml_cgraph * g) {
-        if (g->n_nodes >= 2000) return false;
+        static const int max_nodes = getenv("GGML_SYCL_OP_TIMING_MAX_NODES") ? atoi(getenv("GGML_SYCL_OP_TIMING_MAX_NODES")) : 2000;
+        if (g->n_nodes >= max_nodes) return false;
         bool mm = false;
         for (int i = 0; i < g->n_nodes; ++i) {
             const ggml_tensor * n = g->nodes[i];
@@ -8831,6 +8877,24 @@ static bool ggml_sycl_graph_update_required(ggml_sycl_graph * graph, ggml_cgraph
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            // [a770-opt] GGML_SYCL_GRAPH_WHY: report the first changed node of a few graphs
+            static const bool why = getenv("GGML_SYCL_GRAPH_WHY") != nullptr;
+            static int reported = 0;
+            if (why && !res && reported < 12) {
+                ++reported;
+                const ggml_sycl_graph::node_properties & o = graph->node_props[i];
+                const char * what = memcmp(&o.node, &prop.node, sizeof(ggml_tensor)) != 0 ? "node" :
+                                    memcmp(o.node_src_data_ptrs, prop.node_src_data_ptrs, sizeof(prop.node_src_data_ptrs)) != 0 ? "src ptr" :
+                                    memcmp(o.node_src_ne, prop.node_src_ne, sizeof(prop.node_src_ne)) != 0 ? "src ne" : "src nb";
+                int field = -1;
+                if (what[0] == 'n' && what[1] == 'o') {
+                    const ggml_tensor & a = o.node, & b = prop.node;
+                    field = a.data != b.data ? 0 : memcmp(a.ne, b.ne, sizeof(a.ne)) ? 1 : memcmp(a.nb, b.nb, sizeof(a.nb)) ? 2 :
+                            memcmp(a.op_params, b.op_params, sizeof(a.op_params)) ? 3 : a.view_offs != b.view_offs ? 4 : 5;
+                }
+                GGML_LOG_INFO("[SYCL-GRAPH] %d nodes, first change at node %d (%s %s) in %s field %d\n", cgraph->n_nodes, i,
+                              ggml_op_name(cgraph->nodes[i]->op), cgraph->nodes[i]->name, what, field);
+            }
             graph->node_props[i] = prop;
             res = true;
         }
@@ -8895,10 +8959,13 @@ static bool mul_mat_uses_onednn(int device, ggml_tensor * dst) {
 #endif
 }
 
+// [a770-opt] GGML_SYCL_GRAPH_WHY=1 prints why a graph cannot be recorded
+#define GGML_SYCL_GRAPH_WHY_LOG(...) do { static const bool why_ = getenv("GGML_SYCL_GRAPH_WHY") != nullptr; \
+    if (why_) { GGML_LOG_INFO(__VA_ARGS__); } else { GGML_LOG_DEBUG(__VA_ARGS__); } } while (0)
 static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgraph * cgraph) {
     if (ggml_sycl_info().active_device_count > 1) {
         // A sycl_ex::command_graph object can only be created for a single device
-        GGML_LOG_DEBUG("%s: disabling SYCL graphs due to multiple devices\n", __func__);
+        GGML_SYCL_GRAPH_WHY_LOG("%s: disabling SYCL graphs due to multiple devices\n", __func__);
         return false;
     }
 
@@ -8920,35 +8987,40 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
                 // queue after submitting a memcpy operation, but wait() can't be called on a queue
                 // that is recording to a graph.
                 if (ggml_sycl_mul_mat_id_needs_sync(node)) {
-                    GGML_LOG_DEBUG("%s: disabling SYCL graphs due to host wait in %s\n", __func__,
+                    GGML_SYCL_GRAPH_WHY_LOG("%s: disabling SYCL graphs due to host wait in %s\n", __func__,
                                    ggml_op_name(node_op));
                     return false;
                 }
                 break;
             case GGML_OP_FLASH_ATTN_EXT:
                 if (ggml_sycl_flash_attn_ext_needs_sync(ctx->device, node)) {
-                    GGML_LOG_DEBUG("%s: disabling SYCL graphs due to host wait in %s\n", __func__,
+                    GGML_SYCL_GRAPH_WHY_LOG("%s: disabling SYCL graphs due to host wait in %s\n", __func__,
                                    ggml_op_name(node_op));
                     return false;
                 }
 #ifndef GGML_SYCL_GRAPH_DNNL_SUPPORTED
                 if (ggml_sycl_flash_attn_ext_uses_onednn(ctx->device, node)) {
-                    GGML_LOG_DEBUG("%s: disabling SYCL graphs due to %s using oneDNN\n", __func__,
+                    GGML_SYCL_GRAPH_WHY_LOG("%s: disabling SYCL graphs due to %s using oneDNN\n", __func__,
                                    ggml_op_name(node_op));
                     return false;
                 }
 #endif
                 break;
             case GGML_OP_MUL_MAT:
+                // [a770-opt] a Hadamard rotation shaped as a multi-row MUL_MAT runs on the FWHT kernel, not oneMKL
+                if (ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD && ggml_sycl_fwht_supported(node->src[1], node)) {
+                    break;
+                }
                 // oneMKL gemm (multi-token batches) cannot be recorded to a graph.
                 if (cgraph->nodes[i]->src[1]->ne[1] > 1) {
+                    GGML_SYCL_GRAPH_WHY_LOG("%s: disabling SYCL graphs: multi-token MUL_MAT %s\n", __func__, node->name);
                     return false;
                 }
                 // We cannot use graphs with ggml_sycl_mul_mat() when SYCL async memory allocation extensions are not available,
                 // as SYCL malloc / free and host wait calls are not supported when recording to a graph which are all present
                 // in reordering.
                 if (!g_ggml_sycl_use_async_mem_op) {
-                    GGML_LOG_DEBUG(
+                    GGML_SYCL_GRAPH_WHY_LOG(
                         "%s: disabling SYCL graphs due to unsupported node type when using a compiler without the "
                         "oneAPI async memory allocation extension "
                         "%s\n",
@@ -8957,7 +9029,7 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
                 }
 #ifndef GGML_SYCL_GRAPH_DNNL_SUPPORTED
                 if (mul_mat_uses_onednn(ctx->device, node)) {
-                    GGML_LOG_DEBUG("%s: disabling SYCL graphs due to %s using oneDNN\n", __func__,
+                    GGML_SYCL_GRAPH_WHY_LOG("%s: disabling SYCL graphs due to %s using oneDNN\n", __func__,
                                    ggml_op_name(node_op));
                     return false;
                 }
@@ -9062,7 +9134,9 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
     bool              use_sycl_graph = false;
     ggml_sycl_graph * graph          = nullptr;
 
-    if (g_ggml_sycl_enable_graph) {
+    const bool graph_on = g_ggml_sycl_enable_graph > 0 ||
+                          (g_ggml_sycl_enable_graph < 0 && ggml_sycl_device_is_alchemist(sycl_ctx->device));
+    if (graph_on) {
         if (!ggml_sycl_info().devices[sycl_ctx->device].graph_support) {
             // the device does not change, so report this once
             if (sycl_ctx->graph_compatible != false) {
@@ -9116,6 +9190,14 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             }
         }
 
+        {
+            static const bool why = getenv("GGML_SYCL_GRAPH_WHY") != nullptr;
+            static long n_calls = 0, n_changed = 0, n_replay = 0, n_record = 0;
+            ++n_calls; n_changed += properties_changed; n_replay += replay_graph; n_record += replay_graph && sycl_graph_update_required;
+            if (why && n_calls % 64 == 0) {
+                GGML_LOG_INFO("[SYCL-GRAPH] %ld calls: %ld changed, %ld replayed, %ld recorded\n", n_calls, n_changed, n_replay, n_record);
+            }
+        }
         if (replay_graph) {
             if (sycl_graph_update_required) {
                 const bool graph_update_support = ggml_sycl_info().devices[sycl_ctx->device].graph_update_support;

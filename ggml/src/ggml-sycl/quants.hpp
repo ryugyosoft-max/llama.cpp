@@ -77,6 +77,26 @@ template <> struct block_q_t<GGML_TYPE_PQ2_0> {
     static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
 };
 
+// [a770-opt] Q2_0 reordered like PQ2_0: all 2-bit codes first (16 B per 64-element block), then the fp16 scales
+template <> struct block_q_t<GGML_TYPE_Q2_0> {
+    struct traits {
+        static constexpr uint32_t qk       = QK2_0;
+        static constexpr uint32_t qi       = QK2_0 / 16;  // 16 two-bit quants per int
+        static constexpr uint32_t qr       = 4;
+        static constexpr uint32_t vdr_mmvq = 4;
+    };
+
+    static constexpr std::pair<int, int> get_block_offset(const int block_index, const int /* nblocks */) {
+        return { block_index * (QK2_0 / 4), 0 };
+    }
+
+    static constexpr std::pair<int, int> get_d_offset(int nrows, int ncols, const int block_index) {
+        return { (ncols / 4 * nrows) + block_index * sizeof(ggml_half), 0 };
+    }
+
+    static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
+};
+
 template <> struct block_q_t<GGML_TYPE_PTQ1_0> {
     struct traits {
         static constexpr uint32_t qk       = QK_PTQ1_0;

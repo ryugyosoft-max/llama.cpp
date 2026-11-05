@@ -394,6 +394,23 @@ static bool ggml_sycl_op_fwht_impl(ggml_backend_sycl_context & ctx, const ggml_t
     }
 }
 
+// [a770-opt] same acceptance test as ggml_sycl_op_fwht(), without launching (used by the SYCL graph compatibility scan)
+bool ggml_sycl_fwht_supported(const ggml_tensor * src, const ggml_tensor * dst) {
+    if (dst->type != GGML_TYPE_F32 || !ggml_are_same_shape(src, dst) || !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    if (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16) {
+        return false;
+    }
+    switch (src->ne[0]) {
+        case 64: case 128: case 256: case 512: case 384: case 768: case 640: case 1280:
+        case 1024: case 2048: case 4096: case 8192:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
     if (dst->type != GGML_TYPE_F32) {
         return false;

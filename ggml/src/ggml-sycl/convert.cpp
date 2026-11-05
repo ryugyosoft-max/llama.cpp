@@ -186,6 +186,21 @@ static void dequantize_row_pq2_0_sycl_reorder(const void * vx, dst_t * y, const 
 }
 
 template <typename dst_t>
+static void dequantize_row_q2_0_sycl_reorder(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
+    GGML_ASSERT(k % QK2_0 == 0);
+    const uint8_t *    qs = (const uint8_t *) vx;
+    const sycl::half * d  = (const sycl::half *) (qs + k / 4);
+    stream->parallel_for(sycl::range<1>(k / 4), [=](sycl::id<1> i) {
+        const float   dv = d[i / (QK2_0 / 4)];
+        const uint8_t q  = qs[i];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            y[i * 4 + j] = (float) (((q >> (2 * j)) & 3) - 1) * dv;
+        }
+    });
+}
+
+template <typename dst_t>
 static void dequantize_row_ptq1_0_sycl_reorder(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
     GGML_ASSERT(k % QK_PTQ1_0 == 0);
     const int64_t      nb = k / QK_PTQ1_0;
@@ -697,6 +712,10 @@ static to_t_sycl_t<dst_t> ggml_get_dequant_sycl(ggml_type type, ggml_tensor * ds
         case GGML_TYPE_Q1_0:
             return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0, dst_t>;
         case GGML_TYPE_Q2_0:
+            if (dst->src[0]->extra &&
+                ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                return dequantize_row_q2_0_sycl_reorder;
+            }
             return dequantize_block_sycl<QK2_0, QR2_0, dequantize_q2_0, dst_t>;
         case GGML_TYPE_PTQ1_0:
             if (dst->src[0]->extra &&

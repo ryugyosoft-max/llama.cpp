@@ -1360,6 +1360,34 @@ vec_dot_q2_0_q8_1(const void *__restrict__ vbq,
     return sum0 + sum1;
 }
 
+// [a770-opt] Q2_0 (64 elements, codes value+1, 2 bits, lowest first) with the PQ2_0 lane split:
+// iqs indexes 2-byte groups of qs (8 elements), 8 lanes per block, 2 dp4a per lane instead of
+// QI2_0 = 2 lanes per block with a long serial chain.
+#define MMVQ_Q2_0_QI 8
+
+static __dpct_inline__ float
+vec_dot_q2_0_q8_1_wide(const void *__restrict__ vbq,
+                       const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
+    const block_q2_0 * bq2 = (const block_q2_0 *) vbq;
+
+    const block_q8_1 * bq8_1_chunk = bq8_1 + (iqs >> 2);
+    const int          u_base      = 2 * (iqs & 3);
+
+    uint32_t val = (uint32_t) *(const uint16_t *) (bq2->qs + 2 * iqs);
+
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < 2; ++l) {
+        const uint32_t vi = unpack_2bit_to_byte_lanes(val & 0xFFu);
+        val >>= 8;
+        const int u = get_int_from_int8_aligned(bq8_1_chunk->qs, u_base + l);
+        sumi = dpct::dp4a(vi, u, sumi);
+    }
+
+    const sycl::float2 ds8f = bq8_1_chunk->ds.convert<float, sycl::rounding_mode::automatic>();
+    return (float) bq2->d * (sumi * ds8f.x() - 0.25f * ds8f.y());
+}
+
 static __dpct_inline__ float
 vec_dot_q4_1_q8_1(const void *__restrict__ vbq,
                   const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
@@ -2185,6 +2213,41 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_PQ2_0> {
         float sum = 0.0f;
 #pragma unroll
         for (int b = 0; b < (int) pq2_0_traits::vdr_mmvq / 2; ++b) {
+            const int m    = iqs + 2 * b;
+            int       sumi = 0;
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int v = get_int_from_uint8_aligned(qs, m + h);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const int q  = (v >> (8 * j)) & 0xFF;
+                    const int vi = (q & 3) | ((q >> 2 & 3) << 8) | ((q >> 4 & 3) << 16) | ((q >> 6 & 3) << 24);
+                    sumi = dpct::dp4a(vi, get_int_from_int8_aligned(q8_1_quant_ptr, 4 * (m + h) + j), sumi);
+                }
+            }
+            const sycl::float2 ds8f = q8_1_ds[m / 2].convert<float, sycl::rounding_mode::automatic>();
+            sum += sumi * ds8f.x() - ds8f.y();
+        }
+        return d * sum;
+    };
+};
+// [a770-opt] Q2_0 shares the PQ2_0 code (value + 1, 2 bits, lowest first); one lane per 64-element block
+template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q2_0> {
+    static constexpr ggml_type gtype = GGML_TYPE_Q2_0;
+
+    using q2_0_block  = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q2_0>;
+    using q2_0_traits = typename q2_0_block::traits;
+
+    // Each step takes 2 ints of quants = one q8_1 block of 32 values. Value is (q - 1) * d.
+    __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+                                     const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr,
+                                     const sycl::half2 * q8_1_ds, const int & iqs) {
+        const uint8_t * qs = static_cast<const uint8_t *>(vbq) + ibx_offset.first;
+        const ggml_half d  = *(reinterpret_cast<const ggml_half *>(static_cast<const uint8_t *>(vbq) + d_offset.first));
+
+        float sum = 0.0f;
+#pragma unroll
+        for (int b = 0; b < (int) q2_0_traits::vdr_mmvq / 2; ++b) {
             const int m    = iqs + 2 * b;
             int       sumi = 0;
 #pragma unroll
