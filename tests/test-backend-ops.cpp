@@ -14130,6 +14130,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // [a770-opt] single-token Hadamard rotations at Bonsai 2 widths
+    for (int n : {1024, 4096}) {
+        test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, n, 1, n));
+    }
+    test_cases.emplace_back(new test_fwht_signed(4096, 4096, 1));
+    test_cases.emplace_back(new test_fwht_signed(1024, 5120, 1));
 
     // ARC-LAB: Bonsai 2 GDN layer shape (16 k-heads x 128, 48 v-heads): prompt batch and decode
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 1, 3));

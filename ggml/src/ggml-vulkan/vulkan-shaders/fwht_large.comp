@@ -1,0 +1,93 @@
+#version 450
+
+// [a770-opt] Normalized Sylvester fast Walsh-Hadamard transform for wide rows (N = 1024..8192),
+// one row per workgroup. Thread t owns the EPT consecutive elements t*EPT .. t*EPT+EPT-1:
+// butterflies with h < EPT stay in registers, larger ones exchange through shared memory
+// (the partner of element t*EPT+i at distance h is element i of thread t ^ (h/EPT)).
+// Same bindings and push constants as fwht.comp (FWHT_F16 / FWHT_SIGNED variants).
+
+#extension GL_EXT_control_flow_attributes : require
+#ifdef FWHT_F16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#endif
+
+layout(constant_id = 0) const uint WG = 256;
+layout(constant_id = 1) const uint N = 4096;
+layout(constant_id = 2) const uint ROWS = 1;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint n_rows;
+    uint src_offset;
+#ifdef FWHT_SIGNED
+    uint signs_offset;
+    uint signs_ne;
+#endif
+    uint dst_offset;
+    float scale;
+};
+
+layout(binding = 0, std430) readonly buffer A {
+#ifdef FWHT_F16
+    float16_t data_a[];
+#else
+    float data_a[];
+#endif
+};
+layout(binding = 1, std430) writeonly buffer D { float data_d[]; };
+#ifdef FWHT_SIGNED
+layout(binding = 2, std430) readonly buffer S { float data_s[]; };
+#endif
+
+const uint EPT = N / WG;
+const uint SH_STRIDE = EPT + 1; // padding against bank conflicts
+shared float sh[WG * SH_STRIDE];
+
+void main() {
+    const uint t = gl_LocalInvocationID.x;
+
+    for (uint row = gl_WorkGroupID.x; row < n_rows; row += gl_NumWorkGroups.x) {
+        const uint row_offset = row * N;
+        const uint e0 = t * EPT;
+        float r[EPT];
+        [[unroll]] for (uint i = 0; i < EPT; ++i) {
+#ifdef FWHT_SIGNED
+            r[i] = float(data_a[src_offset + row_offset + e0 + i]) * data_s[signs_offset + (row_offset % signs_ne) + e0 + i] * scale;
+#else
+            r[i] = float(data_a[src_offset + row_offset + e0 + i]) * scale;
+#endif
+        }
+
+        [[unroll]] for (uint h = 1; h < EPT; h <<= 1) {
+            [[unroll]] for (uint j = 0; j < EPT; j += 2 * h) {
+                [[unroll]] for (uint k = 0; k < h; ++k) {
+                    const float x = r[j + k];
+                    const float y = r[j + k + h];
+                    r[j + k] = x + y;
+                    r[j + k + h] = x - y;
+                }
+            }
+        }
+
+        [[unroll]] for (uint tb = 1; tb < WG; tb <<= 1) {
+            [[unroll]] for (uint i = 0; i < EPT; ++i) {
+                sh[t * SH_STRIDE + i] = r[i];
+            }
+            barrier();
+            const uint pt = t ^ tb;
+            const bool lower = (t & tb) == 0;
+            [[unroll]] for (uint i = 0; i < EPT; ++i) {
+                const float o = sh[pt * SH_STRIDE + i];
+                r[i] = lower ? r[i] + o : o - r[i];
+            }
+            barrier();
+        }
+
+        [[unroll]] for (uint i = 0; i < EPT; ++i) {
+            data_d[dst_offset + row_offset + e0 + i] = r[i];
+        }
+    }
+}

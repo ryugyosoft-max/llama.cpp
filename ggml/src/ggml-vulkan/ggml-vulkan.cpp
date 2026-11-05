@@ -3637,11 +3637,18 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // Intel Windows driver in range [32.0.101.8509, 32.0.101.8860) will crash when using fwht kernels so we gate that here
     const bool can_use_fwht = device->driver_id != vk::DriverId::eIntelProprietaryWindows ||
         !ggml_vk_intel_windows_driver_in_range(device->properties.driverVersion, 101, 8509, 101, 8860);
+    const bool xe1_fwht_large = can_use_fwht && device->vendor_id == VK_VENDOR_ID_INTEL && device->architecture == INTEL_XE1 &&
+        !getenv("GGML_VK_DISABLE_FWHT_LARGE");
     if (can_use_fwht) {
         const bool use_subgroup = device->subgroup_basic && device->subgroup_shuffle;
         int idx = 0;
         const uint32_t sg = std::max(device->subgroup_size, 1u);
         for (uint32_t n : {64, 128, 256, 512, 1024, 2048, 4096, 8192}) {
+            // [a770-opt] built by fwht_large below
+            if (xe1_fwht_large && n >= 1024) {
+                ++idx;
+                continue;
+            }
             const bool wide = n > GGML_VK_FWHT_MAX_SUBGROUP_N || n / sg > GGML_VK_FWHT_MAX_SUBGROUP_EL_W;
             if (use_subgroup && !wide) {
                 if (device->subgroup_size <= n) {
@@ -3666,6 +3673,24 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     }
                     device->fwht_rows_per_wg[idx] = rows;
                 }
+            }
+            ++idx;
+        }
+    }
+
+    // [a770-opt] wide rows on Intel Xe-HPG: the per-subgroup register variant spills from 1024 up
+    // (1024 x 2048 rows: 452 us vs 60 us at 512); one row per 256-thread workgroup through shared memory instead
+    if (xe1_fwht_large) {
+        static const uint32_t fwl_wg = getenv("GGML_VK_FWHT_LARGE_WG") ? atoi(getenv("GGML_VK_FWHT_LARGE_WG")) : 1024;
+        int idx = 4;
+        for (uint32_t n : {1024, 2048, 4096, 8192}) {
+            if ((uint64_t)(n + 1024) * sizeof(float) <= device->properties.limits.maxComputeSharedMemorySize) {
+                ggml_vk_create_pipeline(device, device->pipeline_fwht_f32[idx], "fwht_large_f32", fwht_large_f32_len, fwht_large_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { std::min(fwl_wg, n / 4), n, 1 }, 1);
+                ggml_vk_create_pipeline(device, device->pipeline_fwht_signed_f32[idx], "fwht_large_signed_f32", fwht_large_signed_f32_len, fwht_large_signed_f32_data, "main", 3, sizeof(vk_op_fwht_signed_push_constants), {1, 1, 1}, { std::min(fwl_wg, n / 4), n, 1 }, 1);
+                if (device->fp16) {
+                    ggml_vk_create_pipeline(device, device->pipeline_fwht_f16[idx], "fwht_large_f16", fwht_large_f16_len, fwht_large_f16_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { std::min(fwl_wg, n / 4), n, 1 }, 1);
+                }
+                device->fwht_rows_per_wg[idx] = 1;
             }
             ++idx;
         }
