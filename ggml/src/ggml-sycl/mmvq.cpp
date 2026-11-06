@@ -1,6 +1,7 @@
 #include "xe2-dpas.hpp"
 #include "mmvq.hpp"
 #include "fattn-xe1dec.hpp"
+#include "q4_0-xe1.hpp"
 
 #include "ggml.h"
 #include "common.hpp"
@@ -1348,9 +1349,20 @@ static void reorder_mul_mat_vec_ptq1_0_q8_1_sycl(const void * vx, const void * v
     }
 }
 
+// [a770-opt] On Alchemist the decode-once kernel is slower than re-decoding per column (A770, Bonsai 27B shapes,
+// 2/3/4 columns: 97/118/170 us vs 81/100/123 us; MTP draft 2: 27B 39.6 -> 45.1, 9B 106.5 -> 117.0 t/s), so it is off
+// there by default. GGML_SYCL_PTQ1_NCOLS_DEC=0/1 forces it; GGML_SYCL_PTQ1_NCOLS_DEC_OFF still turns it off.
 bool ggml_sycl_ptq1_0_ncols_dec_enabled() {
-    static const bool off = getenv("GGML_SYCL_PTQ1_NCOLS_DEC_OFF") != nullptr;
-    return !off;
+    static const int on = [] {
+        if (getenv("GGML_SYCL_PTQ1_NCOLS_DEC_OFF")) {
+            return 0;
+        }
+        if (const char * e = getenv("GGML_SYCL_PTQ1_NCOLS_DEC")) {
+            return atoi(e) != 0 ? 1 : 0;
+        }
+        return ggml_sycl_device_is_alchemist(ggml_sycl_get_device()) ? 0 : 1;
+    }();
+    return on != 0;
 }
 
 // ARC-LAB: PTQ1_0 multi-column mat-vec (MTP verify, n-gram drafts, fused gate/up) that decodes each block's trits
@@ -3872,6 +3884,8 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                             src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
                             src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
                         return;
+                    } else if (ggml_sycl_q4_0_xe1_enabled(ctx.device)) {
+                        ggml_sycl_q4_0_xe1_mul_mat_vec(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
                     } else {
                         GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_0_q8_1_sycl\n");
                         reorder_mul_mat_vec_q4_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);

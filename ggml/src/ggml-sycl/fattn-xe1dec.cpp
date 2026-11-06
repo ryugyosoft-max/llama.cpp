@@ -33,6 +33,9 @@ struct xe1dec_params {
     int64_t nbq2, nbq3, nbk1, nbk2, nbk3, nbv1, nbv2, nbv3;
     int64_t m_batch;        // mask batch stride in halfs
     int     nem3;
+    int     nq;             // query tokens (1 for decode, 2..4 to verify MTP drafts): group 0 = batch * nq + query
+    int64_t nbq1;           // Q stride between query tokens (bytes)
+    int64_t m_row;          // mask stride between query tokens (halfs)
     int     KV, split_kv, k_num, ne1;
     float   scale;
 };
@@ -63,13 +66,15 @@ static void xe1dec_kernel(const xe1dec_params p, const sycl::nd_item<3> & it, fl
     const int  rsub  = sgid / (DS * GQA);
     const int  split = it.get_group(2);
     const int  kvh   = it.get_group(1);
-    const int  iq3   = it.get_group(0);
+    const int  ibq   = it.get_group(0);     // batch * nq + query token
+    const int  iq3   = ibq / p.nq;
+    const int  iqt   = ibq % p.nq;
     const int  head  = kvh * GQA + hsub;
     const int  cdim0 = dsub * (D / DS);  // first dim of the subgroup's chunk
 
     sycl::half2 q[NW];
     {
-        const float * qp = (const float *) (p.q + iq3 * p.nbq3 + head * p.nbq2) + cdim0;
+        const float * qp = (const float *) (p.q + iq3 * p.nbq3 + iqt * p.nbq1 + head * p.nbq2) + cdim0;
 #pragma unroll
         for (int c = 0; c < NW; ++c) {
             const int d = 2 * (lane + SG * c);
@@ -92,7 +97,7 @@ static void xe1dec_kernel(const xe1dec_params p, const sycl::nd_item<3> & it, fl
 
     const char * kb = p.k + iq3 * p.nbk3 + kvh * p.nbk2 + cdim0 * 2;
     const char * vb = p.v + iq3 * p.nbv3 + kvh * p.nbv2 + cdim0 * 2;
-    const sycl::half * mb = p.m ? p.m + (iq3 % p.nem3) * p.m_batch : nullptr;
+    const sycl::half * mb = p.m ? p.m + (iq3 % p.nem3) * p.m_batch + iqt * p.m_row : nullptr;
     const int sh_row = (rsub * GQA + hsub) * DS;
     // 32-bit row offsets: Alchemist has no native 64-bit integer multiply
     const uint32_t nbk1 = (uint32_t) p.nbk1, nbv1 = (uint32_t) p.nbv1;
@@ -174,14 +179,14 @@ static void xe1dec_kernel(const xe1dec_params p, const sycl::nd_item<3> & it, fl
     const float l_sum = sycl::reduce_over_group(sg, l_lane, sycl::plus<float>());
 
     const int osplit = split * R + rsub;
-    float * op = p.part + ((int64_t) (osplit + p.k_num * iq3) * p.ne1 + head) * D + cdim0;
+    float * op = p.part + ((int64_t) (osplit + p.k_num * ibq) * p.ne1 + head) * D + cdim0;
 #pragma unroll
     for (int c = 0; c < NW; ++c) {
         *(sycl::float2 *) (op + 2 * (lane + SG * c)) = sycl::float2(o[2 * c], o[2 * c + 1]);
     }
     if (lane == 0 && dsub == 0) {
         const int64_t n_o  = (int64_t) D * p.ne1 * p.k_num * it.get_group_range(0);
-        float *       lm   = p.part + n_o + (int64_t) (osplit + p.k_num * iq3) * 2 * p.ne1;
+        float *       lm   = p.part + n_o + (int64_t) (osplit + p.k_num * ibq) * 2 * p.ne1;
         lm[head]           = l_sum;
         lm[p.ne1 + head]   = m_run;
     }
@@ -279,7 +284,9 @@ static void xe1dec_kernel_q(const xe1dec_params p, const sycl::nd_item<3> & it, 
     const int  rsub  = sgid / (DS * GQA);
     const int  split = it.get_group(2);
     const int  kvh   = it.get_group(1);
-    const int  iq3   = it.get_group(0);
+    const int  ibq   = it.get_group(0);     // batch * nq + query token
+    const int  iq3   = ibq / p.nq;
+    const int  iqt   = ibq % p.nq;
     const int  head  = kvh * GQA + hsub;
     const int  cdim0 = dsub * (D / DS);
 
@@ -287,7 +294,7 @@ static void xe1dec_kernel_q(const xe1dec_params p, const sycl::nd_item<3> & it, 
     float q[NS][VP];
     bool  b1[NS];
     {
-        const float * qp = (const float *) (p.q + iq3 * p.nbq3 + head * p.nbq2) + cdim0;
+        const float * qp = (const float *) (p.q + iq3 * p.nbq3 + iqt * p.nbq1 + head * p.nbq2) + cdim0;
 #pragma unroll
         for (int sl = 0; sl < NS; ++sl) {
             b1[sl] = xe1q_blk<KVT>(lane, sl) != 0;
@@ -318,7 +325,7 @@ static void xe1dec_kernel_q(const xe1dec_params p, const sycl::nd_item<3> & it, 
     const int    chunk0 = (cdim0 / 32) * QI::BB;
     const char * kb     = p.k + iq3 * p.nbk3 + kvh * p.nbk2 + chunk0;
     const char * vb     = p.v + iq3 * p.nbv3 + kvh * p.nbv2 + chunk0;
-    const sycl::half * mb = p.m ? p.m + (iq3 % p.nem3) * p.m_batch : nullptr;
+    const sycl::half * mb = p.m ? p.m + (iq3 % p.nem3) * p.m_batch + iqt * p.m_row : nullptr;
     const int sh_row = (rsub * GQA + hsub) * DS;
     const uint32_t nbk1 = (uint32_t) p.nbk1, nbv1 = (uint32_t) p.nbv1;
 
@@ -415,7 +422,7 @@ static void xe1dec_kernel_q(const xe1dec_params p, const sycl::nd_item<3> & it, 
     const float l_sum = sycl::reduce_over_group(sg, l_lane, sycl::plus<float>());
 
     const int osplit = split * R + rsub;
-    float * op = p.part + ((int64_t) (osplit + p.k_num * iq3) * p.ne1 + head) * D + cdim0;
+    float * op = p.part + ((int64_t) (osplit + p.k_num * ibq) * p.ne1 + head) * D + cdim0;
 #pragma unroll
     for (int sl = 0; sl < NS; ++sl) {
 #pragma unroll
@@ -428,7 +435,7 @@ static void xe1dec_kernel_q(const xe1dec_params p, const sycl::nd_item<3> & it, 
     }
     if (lane == 0 && dsub == 0) {
         const int64_t n_o  = (int64_t) D * p.ne1 * p.k_num * it.get_group_range(0);
-        float *       lm   = p.part + n_o + (int64_t) (osplit + p.k_num * iq3) * 2 * p.ne1;
+        float *       lm   = p.part + n_o + (int64_t) (osplit + p.k_num * ibq) * 2 * p.ne1;
         lm[head]           = l_sum;
         lm[p.ne1 + head]   = m_run;
     }
@@ -586,7 +593,7 @@ bool ggml_sycl_flash_attn_ext_xe1dec_supported(int device, const ggml_tensor * d
     static const bool quant_off = getenv("GGML_SYCL_XE1DEC_QUANT_OFF") != nullptr;
     const bool kv_f16   = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
     const bool kv_quant = !quant_off && K->type == V->type && (K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q4_0);
-    if (Q->ne[1] != 1 || Q->type != GGML_TYPE_F32 || !(kv_f16 || kv_quant) ||
+    if (Q->ne[1] < 1 || Q->ne[1] > 4 || Q->type != GGML_TYPE_F32 || !(kv_f16 || kv_quant) ||
         dst->type != GGML_TYPE_F32 || V->ne[0] != D || (D != 128 && D != 256) || K->ne[1] < min_kv ||
         max_bias != 0.0f || softcap != 0.0f || (sinks && sinks->type != GGML_TYPE_F32)) {
         return false;
@@ -598,7 +605,8 @@ bool ggml_sycl_flash_attn_ext_xe1dec_supported(int device, const ggml_tensor * d
     if (gqa < 2 || gqa > 8 || K->ne[2] != V->ne[2] || K->ne[3] != Q->ne[3] || V->ne[3] != Q->ne[3]) {
         return false;
     }
-    if (mask && (mask->type != GGML_TYPE_F16 || mask->ne[0] < K->ne[1] || mask->ne[2] != 1)) {
+    if (mask && (mask->type != GGML_TYPE_F16 || mask->ne[0] < K->ne[1] || mask->ne[2] != 1 || mask->ne[1] < Q->ne[1] ||
+                 mask->nb[1] % 2 != 0)) {
         return false;
     }
     auto al16 = [](size_t x) { return x % 16 == 0; };
@@ -607,6 +615,9 @@ bool ggml_sycl_flash_attn_ext_xe1dec_supported(int device, const ggml_tensor * d
         return al16(Q->nb[2]) && al16(Q->nb[3]) && al4(K->nb[1]) && al4(K->nb[2]) && al4(K->nb[3]) && al4(V->nb[1]) &&
                al4(V->nb[2]) && al4(V->nb[3]) && al4((uintptr_t) K->data) && al4((uintptr_t) V->data) &&
                K->nb[0] == ggml_type_size(K->type) && ggml_is_contiguous(dst);
+    }
+    if (Q->ne[1] > 1 && !al16(Q->nb[1])) {
+        return false;
     }
     return al16(Q->nb[2]) && al16(Q->nb[3]) && al16(K->nb[1]) && al16(K->nb[2]) && al16(K->nb[3]) && al16(V->nb[1]) &&
            al16(V->nb[2]) && al16(V->nb[3]) && ggml_is_contiguous(dst);
@@ -620,7 +631,8 @@ void ggml_sycl_flash_attn_ext_xe1dec(ggml_backend_sycl_context & ctx, ggml_tenso
     const int KV   = (int) K->ne[1];
     const int nkvh = (int) K->ne[2];
     const int ne1  = (int) Q->ne[2];  // query heads
-    const int ne3  = (int) Q->ne[3];
+    const int nq   = (int) Q->ne[1];          // query tokens: each is its own row of the grid
+    const int ne3  = (int) Q->ne[3] * nq;     // batch x query rows; dst [D, heads, nq, batch] matches this order
     const int gqa  = ne1 / nkvh;
     float scale;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
@@ -646,6 +658,9 @@ void ggml_sycl_flash_attn_ext_xe1dec(ggml_backend_sycl_context & ctx, ggml_tenso
     p.nbv1 = V->nb[1]; p.nbv2 = V->nb[2]; p.nbv3 = V->nb[3];
     p.m_batch = mask ? (int64_t) (mask->nb[3] / sizeof(sycl::half)) : 0;
     p.nem3 = mask ? (int) std::max<int64_t>(1, mask->ne[3]) : 1;
+    p.nq   = nq;
+    p.nbq1 = Q->nb[1];
+    p.m_row = mask ? (int64_t) (mask->nb[1] / sizeof(sycl::half)) : 0;
     p.KV = KV; p.split_kv = split_kv; p.k_num = k_num; p.ne1 = ne1; p.scale = scale;
 
     if (getenv("GGML_SYCL_XE1DEC_DBG") && atoi(getenv("GGML_SYCL_XE1DEC_DBG")) == 2) {
@@ -673,7 +688,7 @@ void ggml_sycl_flash_attn_ext_xe1dec(ggml_backend_sycl_context & ctx, ggml_tenso
     const float * pp = part.get();
     const float * sk = sinks ? (const float *) sinks->data : nullptr;
     float *       dd = (float *) dst->data;
-    const int     ne2 = (int) Q->ne[1];  // = 1
+    const int     ne2 = 1;  // query rows are folded into ne3
     stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<float, 1> sh_w(sycl::range<1>(k_num), cgh);
         cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(ne3, (D + 63) / 64, (size_t) ne1 * 64), sycl::range<3>(1, 1, 64)),
