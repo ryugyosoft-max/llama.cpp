@@ -8944,7 +8944,9 @@ static bool ggml_sycl_try_add_norm_rot(ggml_backend_sycl_context & ctx, ggml_cgr
         float *       pao = add_out;
         float *       pn  = normed;
         const int     Ki  = (int) K;
-        ctx.stream()->parallel_for(sycl::nd_range<1>(1024, 1024), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+        ctx.stream()->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> red(sycl::range<1>(64), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(1024, 1024), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
             const int t = it.get_local_id(0);
             float     v[16], ss = 0.0f;
             const int n = Ki / 1024;
@@ -8953,7 +8955,16 @@ static bool ggml_sycl_try_add_norm_rot(ggml_backend_sycl_context & ctx, ggml_cgr
                 v[j]        = pb ? pa[e] + pb[e] : pa[e];
                 ss += v[j] * v[j];
             }
-            ss                = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+            {  // sub-group sums -> SLM -> one sub-group (the generic 1024-wide reduce_over_group is slower)
+                const auto sg = it.get_sub_group();
+                ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+                if (sg.get_local_linear_id() == 0) {
+                    red[sg.get_group_linear_id()] = ss;
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+                const int l = sg.get_local_linear_id();
+                ss = sycl::reduce_over_group(sg, red[l] + red[16 + l] + red[32 + l] + red[48 + l], sycl::plus<float>());
+            }
             const float scale = sycl::rsqrt(ss / Ki + eps);
             for (int j = 0; j < n; ++j) {
                 const int e = t + 1024 * j;
@@ -8964,6 +8975,7 @@ static bool ggml_sycl_try_add_norm_rot(ggml_backend_sycl_context & ctx, ggml_cgr
                     pn[e] = scale * v[j] * pw[e];
                 }
             }
+        });
         });
     } else
     if (!ggml_sycl_t2_add_norm_rot(*ctx.stream(), add ? (const float *) add->src[0]->data : (const float *) x->data,

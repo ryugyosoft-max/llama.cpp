@@ -900,7 +900,7 @@ bool ggml_sycl_fwht4096_add_norm_rot(ggml_backend_sycl_context & ctx, const floa
     static const bool rot_q8 = ggml_sycl_knob("GGML_SYCL_ROT_Q8", 0) != 0;  // slower: lengthens the 1-work-group kernel
     int8_t * q8 = rot_q8 ? (int8_t *) ggml_sycl_xe1_stash_slot(ctx.stream(), 4096 + 128 * 4) : nullptr;
     ctx.stream()->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<float, 1> sl(sycl::range<1>(4096 + 256), cgh);
+        sycl::local_accessor<float, 1> sl(sycl::range<1>(4096 + 256 + 64), cgh);
         cgh.parallel_for(sycl::nd_range<1>(1024, 1024), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
             const auto sg   = it.get_sub_group();
             const int  t    = (int) it.get_local_id(0);
@@ -917,7 +917,18 @@ bool ggml_sycl_fwht4096_add_norm_rot(ggml_backend_sycl_context & ctx, const floa
                 v[k] = x;
                 ss += x * x;
             }
-            ss                = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+            {  // sub-group sums -> SLM -> one sub-group (the generic 1024-wide reduce_over_group is slower)
+                static_assert(1024 / 16 == 64, "64 sub-groups");
+                const auto sg0 = it.get_sub_group();
+                ss = sycl::reduce_over_group(sg0, ss, sycl::plus<float>());
+                if (sg0.get_local_linear_id() == 0) {
+                    s[4096 + 256 + sg0.get_group_linear_id()] = ss;  // past the padded transpose area (max index 4350)
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+                const int l = sg0.get_local_linear_id();
+                float     p = s[4352 + l] + s[4352 + 16 + l] + s[4352 + 32 + l] + s[4352 + 48 + l];
+                ss          = sycl::reduce_over_group(sg0, p, sycl::plus<float>());
+            }
             const float rnorm = sycl::rsqrt(ss / 4096 + eps);
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
