@@ -9224,6 +9224,131 @@ static bool ggml_sycl_try_conv_chain_impl(ggml_backend_sycl_context & ctx, ggml_
     return true;
 }
 
+// [a770-opt] DeltaNet output chain for one token in one kernel (GGML_SYCL_DN_OUT, default on):
+//   RMS_NORM(per head) -> MUL(ssm_norm w) -> SWIGLU(z, .) -> RESHAPE/PERMUTE views -> CONT
+// One work-group per head reduces its S values and writes silu(z) * norm * w straight to the CONT position (the
+// permuted view inverted per element; the host checks the inverse round-trips). 3 launches -> 1 per DeltaNet layer.
+static bool ggml_sycl_try_dn_out_chain(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int & i) {
+    if (!ggml_sycl_knob("GGML_SYCL_DN_OUT", 1) || i + 3 >= cgraph->n_nodes) {
+        return false;
+    }
+    ggml_tensor * norm = cgraph->nodes[i];
+    ggml_tensor * mul  = cgraph->nodes[i + 1];
+    ggml_tensor * glu  = cgraph->nodes[i + 2];
+    if (norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || glu->op != GGML_OP_GLU || mul->src[0] != norm ||
+        glu->src[1] != mul || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0) {
+        return false;
+    }
+    const ggml_tensor * o = norm->src[0];
+    const ggml_tensor * w = mul->src[1];
+    const ggml_tensor * z = glu->src[0];
+    const int64_t S = norm->ne[0], H = norm->ne[1];
+    auto f32 = [](const ggml_tensor * t) { return t->type == GGML_TYPE_F32; };
+    if (!f32(o) || !f32(w) || !f32(z) || !f32(norm) || !f32(mul) || !f32(glu) || o->ne[2] != 1 || o->ne[3] != 1 ||
+        o->nb[0] != sizeof(float) || o->nb[1] % sizeof(float) != 0 || !ggml_is_contiguous(w) || ggml_nelements(w) != S ||
+        !ggml_is_contiguous(z) || !ggml_are_same_shape(z, norm) || !ggml_is_contiguous(glu) || S % 16 != 0 || S > 1024) {
+        return false;
+    }
+    // views from the SWIGLU output to a CONT
+    std::vector<int> idx = { i, i + 1, i + 2 };
+    const ggml_tensor * cur = glu;
+    int ict = -1;
+    for (int j = i + 3; j < cgraph->n_nodes && j <= i + 8; ++j) {
+        ggml_tensor * n = cgraph->nodes[j];
+        if (n->src[0] != cur) {
+            return false;
+        }
+        idx.push_back(j);
+        if (n->op == GGML_OP_CONT) {
+            ict = j;
+            break;
+        }
+        if (n->op != GGML_OP_RESHAPE && n->op != GGML_OP_PERMUTE && n->op != GGML_OP_VIEW && n->op != GGML_OP_TRANSPOSE) {
+            return false;
+        }
+        cur = n;
+    }
+    if (ict < 0) {
+        return false;
+    }
+    ggml_tensor *       ct = cgraph->nodes[ict];
+    const ggml_tensor * v  = ct->src[0];
+    if (!f32(ct) || !ggml_is_contiguous(ct) || ggml_nelements(ct) != S * H || v->data != glu->data) {
+        return false;
+    }
+    {
+        std::vector<ggml_op> ops;
+        for (int j : idx) ops.push_back(cgraph->nodes[j]->op);
+        const int outs[1] = { ict };
+        if (!ggml_can_fuse_subgraph_ext(cgraph, idx.data(), (int) idx.size(), ops.data(), outs, 1)) {
+            return false;
+        }
+    }
+    // inverse of the view: source element e (bytes 4e into the SWIGLU output) -> CONT index
+    int64_t ne[4], nb[4];
+    for (int k = 0; k < 4; ++k) {
+        ne[k] = v->ne[k];
+        nb[k] = (int64_t) v->nb[k];
+    }
+    auto inv = [&](int64_t e) {
+        const int64_t off = e * (int64_t) sizeof(float);
+        int64_t c[4];
+        for (int k = 0; k < 4; ++k) c[k] = (off / nb[k]) % ne[k];
+        return c[0] + ne[0] * (c[1] + ne[1] * (c[2] + ne[2] * c[3]));
+    };
+    for (int64_t d0 = 0; d0 < S * H; ++d0) {  // round trip: CONT index -> view offset -> inverse
+        const int64_t c0 = d0 % ne[0], c1 = (d0 / ne[0]) % ne[1], c2 = (d0 / (ne[0] * ne[1])) % ne[2], c3 = d0 / (ne[0] * ne[1] * ne[2]);
+        const int64_t off = c0 * nb[0] + c1 * nb[1] + c2 * nb[2] + c3 * nb[3];
+        if (off % (int64_t) sizeof(float) != 0 || inv(off / (int64_t) sizeof(float)) != d0) {
+            return false;
+        }
+    }
+    auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * pa = (const char *) a->data, * pb = (const char *) b->data;
+        return pa < pb + ggml_nbytes(b) && pb < pa + ggml_nbytes(a);
+    };
+    if (overlap(ct, o) || overlap(ct, z) || overlap(ct, w)) {
+        return false;
+    }
+    // the inverse in 32-bit shifts and masks (64-bit division is emulated on Xe): element strides and extents must be
+    // powers of two
+    auto lg2 = [](int64_t x) { int l = 0; while ((int64_t) 1 << l < x) ++l; return ((int64_t) 1 << l) == x ? l : -1; };
+    int sh[4], dl[4];
+    uint32_t mk[4];
+    for (int k = 0; k < 4; ++k) {
+        sh[k] = lg2(nb[k] / (int64_t) sizeof(float));
+        mk[k] = (uint32_t) (ne[k] - 1);
+        dl[k] = lg2(ne[k]);
+        if (sh[k] < 0 || dl[k] < 0 || nb[k] % (int64_t) sizeof(float) != 0) {
+            return false;
+        }
+    }
+    const int ds1 = dl[0], ds2 = dl[0] + dl[1], ds3 = dl[0] + dl[1] + dl[2];
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    const char *  od  = (const char *) o->data;
+    const int64_t onb = (int64_t) o->nb[1];
+    const float * wd  = (const float *) w->data;
+    const float * zd  = (const float *) z->data;
+    float *       dd  = (float *) ct->data;
+    const int     Si  = (int) S;
+    const int s0 = sh[0], s1 = sh[1], s2 = sh[2], s3 = sh[3];
+    const uint32_t m0 = mk[0], m1 = mk[1], m2 = mk[2], m3 = mk[3];
+    ctx.stream()->parallel_for(sycl::nd_range<1>((size_t) (H * S), (size_t) S), [=](sycl::nd_item<1> it) {
+        const int64_t h = it.get_group(0);
+        const int     j = it.get_local_id(0);
+        const float   x = *(const float *) (od + h * onb + (int64_t) j * sizeof(float));
+        const float   ss = sycl::reduce_over_group(it.get_group(), x * x, sycl::plus<float>());
+        const float   y  = x * sycl::rsqrt(ss / Si + eps) * wd[j];
+        const uint32_t e  = (uint32_t) h * (uint32_t) Si + (uint32_t) j;
+        const float    zz = zd[e];
+        const uint32_t d  = ((e >> s0) & m0) | (((e >> s1) & m1) << ds1) | (((e >> s2) & m2) << ds2) | (((e >> s3) & m3) << ds3);
+        dd[d] = zz / (1.0f + sycl::native::exp(-zz)) * y;
+    });
+    i = ict;
+    return true;
+}
+
 // ARC-LAB: DeltaNet gate block in one kernel (GGML_SYCL_DN_GATES, default on):
 //   alpha = MUL_MAT(bf16 W_a, x) -> RESHAPE -> ADD(dt bias) -> SOFTPLUS -> MUL(ssm_a) -> RESHAPE
 //   beta  = MUL_MAT(bf16 W_b, x) -> RESHAPE -> SIGMOID
@@ -9628,6 +9753,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 i += 2;
                 continue;
             }
+        }
+        if (node->op == GGML_OP_RMS_NORM && ggml_sycl_try_dn_out_chain(*sycl_ctx, cgraph, i)) {
+            continue;
         }
         if (node->op == GGML_OP_RMS_NORM &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
