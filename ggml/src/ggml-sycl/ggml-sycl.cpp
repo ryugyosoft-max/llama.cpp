@@ -8924,6 +8924,37 @@ static bool ggml_sycl_try_add_norm_rot(ggml_backend_sycl_context & ctx, ggml_cgr
     }
     float eps;
     memcpy(&eps, norm->op_params, sizeof(float));
+    // [a770-opt] decode (one row, no rotation): 32-bit indices, 1024 work-items (the t2 kernel's 64-bit index math is
+    // emulated on Xe; it cost ~12 us per call in-model). GGML_SYCL_ADD_NORM1=0 restores it.
+    if (!mm && M == 1 && K % 1024 == 0 && K <= 16384 && ggml_sycl_knob("GGML_SYCL_ADD_NORM1", 1)) {
+        const float * pa = add ? (const float *) add->src[0]->data : (const float *) x->data;
+        const float * pb = add ? (const float *) add->src[1]->data : nullptr;
+        const float * pw = (const float *) w->data;
+        float *       pao = add_out;
+        float *       pn  = normed;
+        const int     Ki  = (int) K;
+        ctx.stream()->parallel_for(sycl::nd_range<1>(1024, 1024), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const int t = it.get_local_id(0);
+            float     v[16], ss = 0.0f;
+            const int n = Ki / 1024;
+            for (int j = 0; j < n; ++j) {
+                const int e = t + 1024 * j;
+                v[j]        = pb ? pa[e] + pb[e] : pa[e];
+                ss += v[j] * v[j];
+            }
+            ss                = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+            const float scale = sycl::rsqrt(ss / Ki + eps);
+            for (int j = 0; j < n; ++j) {
+                const int e = t + 1024 * j;
+                if (pao) {
+                    pao[e] = v[j];
+                }
+                if (pn) {
+                    pn[e] = scale * v[j] * pw[e];
+                }
+            }
+        });
+    } else
     if (!ggml_sycl_t2_add_norm_rot(*ctx.stream(), add ? (const float *) add->src[0]->data : (const float *) x->data,
                                    add ? (const float *) add->src[1]->data : nullptr, add_out, (const float *) w->data, eps,
                                    normed, signs, mm ? (float *) mm->data : nullptr, M, K, mm)) {
@@ -9186,15 +9217,17 @@ static bool ggml_sycl_try_conv_chain_impl(ggml_backend_sycl_context & ctx, ggml_
     float *       ld  = (float *) l2->data;
     const int     D   = (int) dc;
     const int64_t HL  = l2_in ? H : 0;
-    ctx.stream()->parallel_for(sycl::nd_range<1>((size_t) C, (size_t) S), [=](sycl::nd_item<1> it) {
-        const int64_t c = it.get_global_id(0);
-        const int64_t g = it.get_group(0);
+    // [a770-opt] 32-bit channel offsets (64-bit index math is emulated on Xe)
+    const int xnbf = (int) (xnb / sizeof(float));
+    ctx.stream()->parallel_for(sycl::nd_range<1>((size_t) C, (size_t) S), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+        const int     c = (int) it.get_global_id(0);
+        const int     g = (int) it.get_group(0);
         float         v[8];
         const float * csr = cg_base ? cg_base + (int64_t) cg_ids[0] * cg_rs : csd;
         for (int t = 0; t < D - 1; ++t) {
             v[t] = csr[c * (D - 1) + t];
         }
-        v[D - 1] = *(const float *) (xd + c * xnb);
+        v[D - 1] = ((const float *) xd)[c * xnbf];
         float sum = 0.0f;
         for (int t = 0; t < D; ++t) {
             sum += v[t] * wd[c * D + t];
@@ -9431,6 +9464,31 @@ static bool ggml_sycl_try_dn_gates(ggml_backend_sycl_context & ctx, ggml_cgraph 
     float *          ob    = staged ? sa_out + R * M : (float *) n[8]->data;
     const int        Ki = (int) K, Ri = (int) R, Mi = (int) M;
     constexpr int    WG = 256;
+    if (Mi == 1 && wf32) {
+        // [a770-opt] decode, F32 weights: one token, 32-bit offsets, no runtime-indexed accumulator array
+        ctx.stream()->parallel_for(sycl::nd_range<1>((size_t) 2 * R * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const int     g   = it.get_group(0);
+            const bool    isb = g >= Ri;
+            const int     row = isb ? g - Ri : g;
+            const float * wr  = (const float *) (isb ? pb : pa) + row * Ki;
+            const int     tid = it.get_local_id(0);
+            float         acc = 0.0f;
+            for (int k = tid * 4; k < Ki; k += WG * 4) {
+                const sycl::float4 a4 = *(const sycl::float4 *) (wr + k), x4 = *(const sycl::float4 *) (px + k);
+                acc += a4.x() * x4.x() + a4.y() * x4.y() + a4.z() * x4.z() + a4.w() * x4.w();
+            }
+            const float sum = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
+            if (tid == 0) {
+                if (isb) {
+                    ob[row] = 1.0f / (1.0f + sycl::exp(-sum));
+                } else {
+                    const float v  = sum + pbias[row];
+                    const float sp = sycl::fmax(v, 0.0f) + sycl::log1p(sycl::exp(-sycl::fabs(v)));
+                    oa[row] = sp * psa[row];
+                }
+            }
+        });
+    } else
     ctx.stream()->parallel_for(sycl::nd_range<1>((size_t) 2 * R * WG, WG), [=](sycl::nd_item<1> it) {
         const int        g   = it.get_group(0);
         const bool       isb = g >= Ri;
