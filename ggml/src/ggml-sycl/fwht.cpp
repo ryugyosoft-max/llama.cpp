@@ -3,7 +3,7 @@
 #include "fattn-xe1dec.hpp"
 
 static void launch_fwht4096_wg1024(const float * src, float * dst, const int64_t n_rows, const float scale,
-                                   const float * signs, const int n_blk, dpct::queue_ptr stream);
+                                   const float * signs, const int n_blk, dpct::queue_ptr stream, int8_t * q8 = nullptr);
 
 #include <cmath>
 #define P 1.0f
@@ -427,6 +427,15 @@ bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src,
         return false;
     }
     ggml_sycl_xe1_stash_drop_range(dst->data, ggml_nbytes(dst));  // [a770-opt] no q8 copy: an older one here is stale
+    {  // [a770-opt] decode-sized 4096-point rows: the 1024-wide kernel (as the signed rotations)
+        static const bool on = ggml_sycl_knob("GGML_SYCL_FWHT4096", ggml_sycl_device_is_alchemist(ctx.device) ? 1 : 0) &&
+                               ggml_sycl_knob("GGML_SYCL_FWHT1024", 1);
+        if (on && src->type == GGML_TYPE_F32 && src->ne[0] == 4096 && ggml_nrows(src) <= 8) {
+            launch_fwht4096_wg1024((const float *) src->data, (float *) dst->data, ggml_nrows(src), 1.0f / 64.0f, nullptr,
+                                   1, ctx.stream(), nullptr);
+            return true;
+        }
+    }
 
     switch (src->type) {
         case GGML_TYPE_F32:
@@ -740,8 +749,17 @@ static bool fwht_run(ggml_backend_sycl_context & ctx, const ggml_tensor * src, g
             q8 = (int8_t *) ggml_sycl_xe1_stash_slot(ctx.stream(), (size_t) rows * 4096 + rows * 128 * 4);
         }
         static const bool wg1024 = ggml_sycl_knob("GGML_SYCL_FWHT1024", 1) != 0;
-        if (wg1024 && !q8) {
-            launch_fwht4096_wg1024((const float *) src->data, (float *) dst->data, rows, scale, signs, n_blk, ctx.stream());
+        static const bool rot_q8 = ggml_sycl_knob("GGML_SYCL_ROT_Q8", 0) != 0;  // slower: lengthens the 1-work-group kernel
+        if (wg1024) {
+            int8_t * q8w = q8;
+            if (!q8w && rot_q8 && rows <= 3) {
+                q8w = (int8_t *) ggml_sycl_xe1_stash_slot(ctx.stream(), (size_t) rows * 4096 + rows * 128 * 4);
+            }
+            launch_fwht4096_wg1024((const float *) src->data, (float *) dst->data, rows, scale, signs, n_blk, ctx.stream(), q8w);
+            if (q8w) {
+                ggml_sycl_xe1_stash_put(dst->data, q8w);
+            }
+            return true;
         } else {
             launch_fwht4096((const float *) src->data, (float *) dst->data, rows, scale, signs, n_blk, q8, ctx.stream());
         }
@@ -804,9 +822,40 @@ static inline void fwht4096_wg1024(float (&v)[4], float * s, const sycl::nd_item
     reg2();
 }
 
+// q8_1 SoA copy of a rotated row (quantize_and_reorder_q8_1_soa math) from the final register layout of
+// fwht4096_wg1024: the values go through SLM so each sub-group quantizes 2 contiguous 32-blocks (2 reductions each)
+static inline void fwht4096_wg1024_q8(const float (&v)[4], float * s, const sycl::nd_item<1> & it, int8_t * qrow,
+                                      sycl::half2 * ds_row) {
+    const auto sg   = it.get_sub_group();
+    const int  t    = (int) it.get_local_id(0);
+    const int  lane = sg.get_local_linear_id();
+    const int  lo4 = (t >> 4) & 15, hi2 = t >> 8;
+    it.barrier(sycl::access::fence_space::local_space);  // the transpose reads are done
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        s[lo4 | (lane << 4) | (k << 8) | (hi2 << 10)] = v[k];
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+    const int sgid = (int) sg.get_group_linear_id();
+#pragma unroll
+    for (int bb = 0; bb < 2; ++bb) {
+        const int   b    = sgid * 2 + bb;
+        const float y0   = s[32 * b + lane], y1 = s[32 * b + 16 + lane];
+        const float sum  = sycl::reduce_over_group(sg, y0 + y1, sycl::plus<float>());
+        const float amax = sycl::reduce_over_group(sg, sycl::fmax(sycl::fabs(y0), sycl::fabs(y1)), sycl::maximum<float>());
+        const float d    = amax == 0 ? 1.0f : amax / 127;
+        qrow[32 * b + lane]      = (int8_t) sycl::round(y0 / d);
+        qrow[32 * b + 16 + lane] = (int8_t) sycl::round(y1 / d);
+        if (lane == 0) {
+            ds_row[b] = sycl::half2(sycl::half(amax == 0 ? 0.0f : d), sycl::half(sum));
+        }
+    }
+}
+
 // standalone 4096-point rotation of up to a few rows (one 1024-wide work-group per row)
 static void launch_fwht4096_wg1024(const float * src, float * dst, const int64_t n_rows, const float scale,
-                                   const float * signs, const int n_blk, dpct::queue_ptr stream) {
+                                   const float * signs, const int n_blk, dpct::queue_ptr stream, int8_t * q8) {
+    const int ncols_q8 = (int) n_rows * 4096;
     stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<float, 1> sl(sycl::range<1>(4096 + 256), cgh);
         cgh.parallel_for(sycl::nd_range<1>(n_rows * 1024, 1024), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
@@ -827,6 +876,10 @@ static void launch_fwht4096_wg1024(const float * src, float * dst, const int64_t
             for (int k = 0; k < 4; ++k) {
                 dr[lo4 | (lane << 4) | (k << 8) | (hi2 << 10)] = v[k];
             }
+            if (q8) {
+                fwht4096_wg1024_q8(v, sl.get_multi_ptr<sycl::access::decorated::no>().get(), it, q8 + r * 4096,
+                                   (sycl::half2 *) (q8 + ncols_q8) + r * 128);
+            }
         });
     });
 }
@@ -844,6 +897,8 @@ bool ggml_sycl_fwht4096_add_norm_rot(ggml_backend_sycl_context & ctx, const floa
     }
     ggml_sycl_xe1_stash_drop_range(mm->data, ggml_nbytes(mm));
     float * dst = (float *) mm->data;
+    static const bool rot_q8 = ggml_sycl_knob("GGML_SYCL_ROT_Q8", 0) != 0;  // slower: lengthens the 1-work-group kernel
+    int8_t * q8 = rot_q8 ? (int8_t *) ggml_sycl_xe1_stash_slot(ctx.stream(), 4096 + 128 * 4) : nullptr;
     ctx.stream()->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<float, 1> sl(sycl::range<1>(4096 + 256), cgh);
         cgh.parallel_for(sycl::nd_range<1>(1024, 1024), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
@@ -882,8 +937,14 @@ bool ggml_sycl_fwht4096_add_norm_rot(ggml_backend_sycl_context & ctx, const floa
             for (int k = 0; k < 4; ++k) {
                 dst[lo4 | (lane << 4) | (k << 8) | (hi2 << 10)] = v[k];
             }
+            if (q8) {
+                fwht4096_wg1024_q8(v, s, it, q8, (sycl::half2 *) (q8 + 4096));
+            }
         });
     });
+    if (q8) {
+        ggml_sycl_xe1_stash_put(mm->data, q8);
+    }
     return true;
 }
 

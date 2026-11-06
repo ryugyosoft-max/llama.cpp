@@ -9906,9 +9906,21 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 ops.push_back(cgraph->nodes[j]->op);
             }
             const int out_node = sr ? end : i + 2;
+            // the V cache write right after the K one (VIEW(V) -> SET_ROWS): rides along when its source is ready
+            ggml_tensor * vr   = nullptr;
+            int           vend = end;
+            if (sr && end + 2 < cgraph->n_nodes && cgraph->nodes[end + 1]->op == GGML_OP_VIEW &&
+                cgraph->nodes[end + 2]->op == GGML_OP_SET_ROWS && cgraph->nodes[end + 2]->src[0] == cgraph->nodes[end + 1] &&
+                ggml_sycl_knob("GGML_SYCL_NORM_ROPE_V", 1)) {
+                const ggml_tensor * vv = cgraph->nodes[end + 1];
+                if (vv->view_offs == 0 && ggml_is_contiguous(vv) && vv->view_src && vv->view_src->data == vv->data) {
+                    vr   = cgraph->nodes[end + 2];
+                    vend = end + 2;
+                }
+            }
             if (ggml_can_fuse_subgraph_ext(cgraph, idx.data(), (int) idx.size(), ops.data(), &out_node, 1) &&
-                ggml_sycl_norm_rope_fused(*sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], sr)) {
-                i = end;
+                ggml_sycl_norm_rope_fused(*sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], sr, vr)) {
+                i = vr ? vend : end;
                 continue;
             }
         }

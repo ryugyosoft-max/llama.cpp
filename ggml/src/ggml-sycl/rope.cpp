@@ -792,7 +792,7 @@ bool ggml_sycl_rope_qkv_cache(ggml_backend_sycl_context & ctx, ggml_tensor * rq,
 // extension) [-> f16 KV-cache row via SET_ROWS] in one kernel: one work-group per head, the rotation partners through
 // SLM. Same theta / sector / rope_yarn math as rope_multi. 2-3 launches -> 1 per q and per k.
 bool ggml_sycl_norm_rope_fused(ggml_backend_sycl_context & ctx, const ggml_tensor * norm, const ggml_tensor * mul,
-                               ggml_tensor * rope, ggml_tensor * set_rows) {
+                               ggml_tensor * rope, ggml_tensor * set_rows, ggml_tensor * v_rows) {
     const ggml_tensor * x   = norm->src[0];
     const ggml_tensor * w   = mul->src[0] == norm ? mul->src[1] : mul->src[0];
     const ggml_tensor * pos = rope->src[1];
@@ -831,6 +831,25 @@ bool ggml_sycl_norm_rope_fused(ggml_backend_sycl_context & ctx, const ggml_tenso
         row_idx  = (const int64_t *) set_rows->src[1]->data;
         c_stride = (int64_t) (set_rows->nb[1] / sizeof(sycl::half));
     }
+    // optional V cache write riding along (SET_ROWS of a contiguous f32 V into an f16 cache row): extra work-groups
+    const float *   vsrc     = nullptr;
+    sycl::half *    vcache   = nullptr;
+    const int64_t * vrow_idx = nullptr;
+    int64_t         v_stride = 0;
+    int             v_wgs    = 0;
+    if (v_rows) {
+        const ggml_tensor * vs = v_rows->src[0];
+        if (!set_rows || v_rows->type != GGML_TYPE_F16 || vs->type != GGML_TYPE_F32 || !ggml_is_contiguous(vs) ||
+            v_rows->src[1]->type != GGML_TYPE_I64 || ggml_nelements(v_rows->src[1]) != 1 ||
+            v_rows->nb[0] != sizeof(sycl::half) || ggml_nelements(vs) % D != 0 || ggml_nelements(vs) > 64 * D) {
+            return false;
+        }
+        vsrc     = (const float *) vs->data;
+        vcache   = (sycl::half *) v_rows->data;
+        vrow_idx = (const int64_t *) v_rows->src[1]->data;
+        v_stride = (int64_t) (v_rows->nb[1] / sizeof(sycl::half));
+        v_wgs    = (int) (ggml_nelements(vs) / D);
+    }
     float eps;
     memcpy(&eps, norm->op_params, sizeof(float));
     rope_corr_dims corr_dims;
@@ -845,8 +864,13 @@ bool ggml_sycl_norm_rope_fused(ggml_backend_sycl_context & ctx, const ggml_tenso
     const int       Di  = (int) D;
     ctx.stream()->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<float, 1> sl(sycl::range<1>(D), cgh);
-        cgh.parallel_for(sycl::nd_range<1>((size_t) (NH * D), (size_t) D), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+        cgh.parallel_for(sycl::nd_range<1>((size_t) ((NH + v_wgs) * D), (size_t) D), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
             const int   h  = (int) it.get_group(0), j = (int) it.get_local_id(0);
+            if (h >= NH) {  // V rows into the V cache (uniform per work-group)
+                const int e = (h - (int) NH) * Di + j;
+                vcache[vrow_idx[0] * v_stride + e] = sycl::half(vsrc[e]);
+                return;
+            }
             const float v  = xd[h * xs1 + j];
             const float ss = sycl::reduce_over_group(it.get_group(), v * v, sycl::plus<float>());
             const float y  = v * sycl::rsqrt(ss / Di + eps) * wd[j];
