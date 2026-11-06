@@ -649,3 +649,133 @@ void ggml_sycl_rope_fused(ggml_backend_sycl_context &ctx, ggml_tensor *rope,
     scope_op_debug_print scope_dbg_print(__func__, rope, /*num_src=*/3);
     ggml_sycl_op_rope_impl<true>(ctx, rope, set_rows);
 }
+
+// [a770-opt] One launch for a single decode step's ROPE(Q), ROPE(K) -> K cache rows and V -> V cache rows (the
+// ROPE(Q), ROPE(K), SET_ROWS(K), SET_ROWS(V) chain of a Llama-style layer: 4 kernels -> 1). Normal / NeoX rope over the
+// full head (n_dims == D, no offset), f32 Q/K/V in, f16 or f32 caches written through the set_rows row indices.
+namespace {
+struct rope_qkv_params {
+    const float * q; float * qd; const float * k; const float * v;
+    void * kc; void * vc; const int64_t * ik; const int64_t * iv; const int32_t * pos; const float * ff;
+    int D, Hq, Hk, T, VW;                 // head dim, heads, tokens, V floats per row
+    int qs1, qs2, qd1, qd2, ks1, ks2, vs1; // element strides
+    int64_t kstride, vstride;              // cache row strides (elements)
+    float theta_scale, freq_scale, ext_factor, attn_factor;
+    rope_corr_dims corr;
+    bool neox;
+};
+
+template <typename C>
+static void rope_qkv_kernel(const rope_qkv_params p, const sycl::nd_item<1> & it) {
+    const int half = p.D / 2;
+    const int nq   = p.Hq * p.T * half;
+    const int nk   = p.Hk * p.T * half;
+    const int nv   = p.T * (p.VW / 2);
+    int       w    = (int) it.get_global_id(0);
+    if (w >= nq + nk + nv) {
+        return;
+    }
+    if (w >= nq + nk) {  // V: copy two values into the cache row
+        w -= nq + nk;
+        const int t = w / (p.VW / 2), j = 2 * (w % (p.VW / 2));
+        const float * s = p.v + (int64_t) t * p.vs1 + j;
+        C * d = (C *) p.vc + p.iv[t] * p.vstride + j;
+        d[0] = (C) s[0];
+        d[1] = (C) s[1];
+        return;
+    }
+    const bool is_k = w >= nq;
+    if (is_k) {
+        w -= nq;
+    }
+    const int H  = is_k ? p.Hk : p.Hq;
+    const int pp = w % half;
+    const int h  = (w / half) % H;
+    const int t  = w / (half * H);
+    const int a  = p.neox ? pp : 2 * pp;          // first element of the rotated pair
+    const int b  = p.neox ? pp + half : 2 * pp + 1;
+    float theta = p.pos[t] * dpct::pow(p.theta_scale, (float) pp);
+    if (p.ff) {
+        theta /= p.ff[pp];
+    }
+    float c, s;
+    rope_yarn<true>(theta, p.freq_scale, p.corr, 2 * pp, p.ext_factor, p.attn_factor, c, s);
+    const float * src = is_k ? p.k + (int64_t) h * p.ks1 + (int64_t) t * p.ks2 : p.q + (int64_t) h * p.qs1 + (int64_t) t * p.qs2;
+    const float x0 = src[a], x1 = src[b];
+    const float y0 = x0 * c - x1 * s, y1 = x0 * s + x1 * c;
+    if (is_k) {
+        C * d = (C *) p.kc + p.ik[t] * p.kstride + (int64_t) h * p.D;
+        d[a] = (C) y0;
+        d[b] = (C) y1;
+    } else {
+        float * d = p.qd + (int64_t) h * p.qd1 + (int64_t) t * p.qd2;
+        d[a] = y0;
+        d[b] = y1;
+    }
+}
+}  // namespace
+
+bool ggml_sycl_rope_qkv_cache(ggml_backend_sycl_context & ctx, ggml_tensor * rq, ggml_tensor * rk, ggml_tensor * srk,
+                              ggml_tensor * srv, const float * k_data, const float * v_data) {
+    const ggml_tensor * q = rq->src[0], * k = rk->src[0], * vv = srv->src[0];
+    if (rq->op != GGML_OP_ROPE || rk->op != GGML_OP_ROPE || memcmp(rq->op_params, rk->op_params, sizeof(rq->op_params)) != 0 ||
+        rq->src[1] != rk->src[1] || rq->src[2] != rk->src[2]) {
+        return false;
+    }
+    const int D = (int) q->ne[0], T = (int) q->ne[2];
+    const int n_dims = ((int32_t *) rq->op_params)[1], mode = ((int32_t *) rq->op_params)[2];
+    const int n_offs = ((int32_t *) rq->op_params)[15];
+    if ((mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) || n_dims != D || n_offs != 0 || D % 2 != 0) {
+        return false;
+    }
+    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 || rq->type != GGML_TYPE_F32 || vv->type != GGML_TYPE_F32 ||
+        k->ne[0] != D || k->ne[2] != T || q->ne[3] != 1 || k->ne[3] != 1 || q->nb[0] != 4 || k->nb[0] != 4 ||
+        rq->nb[0] != 4 || vv->nb[0] != 4) {
+        return false;
+    }
+    if (srk->type != srv->type || (srk->type != GGML_TYPE_F16 && srk->type != GGML_TYPE_F32) ||
+        srk->src[1]->type != GGML_TYPE_I64 || srv->src[1]->type != GGML_TYPE_I64 || srk->src[1]->ne[0] != T ||
+        srv->src[1]->ne[0] != T || ggml_nrows(srk->src[1]) != 1 || ggml_nrows(srv->src[1]) != 1) {
+        return false;
+    }
+    const ggml_tensor * kview = srk->src[0];  // [D * Hk, T] flattened view of ROPE(K)
+    if (kview->view_src != rk || kview->ne[0] != D * k->ne[1] || kview->ne[1] != T || !ggml_is_contiguous(kview) ||
+        !ggml_is_contiguous(rk) || srk->ne[0] != kview->ne[0] || vv->ne[1] != T || vv->ne[2] != 1 || vv->ne[3] != 1 ||
+        srv->ne[0] != vv->ne[0] || vv->ne[0] % 2 != 0 || srk->nb[0] != ggml_type_size(srk->type) ||
+        srv->nb[0] != ggml_type_size(srv->type)) {
+        return false;
+    }
+    rope_qkv_params p{};
+    p.q = (const float *) q->data; p.qd = (float *) rq->data; p.k = k_data ? k_data : (const float *) k->data; p.v = v_data ? v_data : (const float *) vv->data;
+    p.kc = srk->data; p.vc = srv->data;
+    p.ik = (const int64_t *) srk->src[1]->data; p.iv = (const int64_t *) srv->src[1]->data;
+    p.pos = (const int32_t *) rq->src[1]->data;
+    p.ff  = rq->src[2] ? (const float *) rq->src[2]->data : nullptr;
+    p.D = D; p.Hq = (int) q->ne[1]; p.Hk = (int) k->ne[1]; p.T = T; p.VW = (int) vv->ne[0];
+    p.qs1 = (int) (q->nb[1] / 4); p.qs2 = (int) (q->nb[2] / 4); p.qd1 = (int) (rq->nb[1] / 4); p.qd2 = (int) (rq->nb[2] / 4);
+    p.ks1 = (int) (k->nb[1] / 4); p.ks2 = (int) (k->nb[2] / 4); p.vs1 = (int) (vv->nb[1] / 4);
+    p.kstride = (int64_t) (srk->nb[1] / ggml_type_size(srk->type));
+    p.vstride = (int64_t) (srv->nb[1] / ggml_type_size(srv->type));
+    float freq_base, beta_fast, beta_slow;
+    const int n_ctx_orig = ((int32_t *) rq->op_params)[4];
+    memcpy(&freq_base, (int32_t *) rq->op_params + 5, sizeof(float));
+    memcpy(&p.freq_scale, (int32_t *) rq->op_params + 6, sizeof(float));
+    memcpy(&p.ext_factor, (int32_t *) rq->op_params + 7, sizeof(float));
+    memcpy(&p.attn_factor, (int32_t *) rq->op_params + 8, sizeof(float));
+    memcpy(&beta_fast, (int32_t *) rq->op_params + 9, sizeof(float));
+    memcpy(&beta_slow, (int32_t *) rq->op_params + 10, sizeof(float));
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, p.corr.v);
+    p.theta_scale = powf(freq_base, -2.0f / n_dims);
+    p.neox        = mode == GGML_ROPE_TYPE_NEOX;
+
+    const int    total = p.Hq * T * (D / 2) + p.Hk * T * (D / 2) + T * (p.VW / 2);
+    const size_t wg    = 256;
+    const size_t n     = (total + wg - 1) / wg * wg;
+    dpct::queue_ptr stream = ctx.stream();
+    if (srk->type == GGML_TYPE_F16) {
+        stream->parallel_for(sycl::nd_range<1>(n, wg), [=](sycl::nd_item<1> it) { rope_qkv_kernel<sycl::half>(p, it); });
+    } else {
+        stream->parallel_for(sycl::nd_range<1>(n, wg), [=](sycl::nd_item<1> it) { rope_qkv_kernel<float>(p, it); });
+    }
+    return true;
+}

@@ -59,7 +59,10 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
     // ARC-LAB: Q6_K (the MTP draft head's FFN) behind GGML_SYCL_Q6K_GLU=1: the generic reorder GLU kernel, whose per-row
     // dot products are the unfused reorder mat-vec's and whose epilogue is the SWIGLU kernel's silu(gate) * up
     const bool q6k_ok  = wu->type == GGML_TYPE_Q6_K && wu->ne[0] % QK_K == 0 && ggml_sycl_knob("GGML_SYCL_Q6K_GLU", 0);
-    const bool type_ok = (wu->type == GGML_TYPE_Q4_K && wu->ne[0] % QK_K == 0) ||
+    // [a770-opt] single-column Q4_0 (Alchemist q4_0-xe1 SWIGLU kernel; the backend declines it elsewhere)
+    const bool q4_0_ok = wu->type == GGML_TYPE_Q4_0 && wu->ne[0] % QK4_0 == 0 && act->ne[1] == 1 &&
+                         glu_op == GGML_GLU_OP_SWIGLU;
+    const bool type_ok = q4_0_ok || (wu->type == GGML_TYPE_Q4_K && wu->ne[0] % QK_K == 0) ||
                          (wu->type == GGML_TYPE_PQ2_0 && wu->ne[0] % QK_PQ2_0 == 0) ||
                          (wu->type == GGML_TYPE_PTQ1_0 && wu->ne[0] % QK_PTQ1_0 == 0) || q6k_ok;
     if (!(type_ok && wu->type == wg->type) && !((plain_pair || xmx_pair || esimd_pair) && wu->ne[0] % row_align == 0)) {
@@ -67,7 +70,7 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
     }
     // single-token PQ2_0 decode is faster unfused (its own 2-row GEMV); fuse for 2..8 columns. ARC-LAB: PTQ1_0 has a
     // single-column fused kernel (pairs core, GGML_SYCL_PTQ1_GLU1=0 turns it off)
-    if (!plain_pair && !xmx_pair && !esimd_pair && wu->type != GGML_TYPE_Q4_K && wu->type != GGML_TYPE_Q6_K && act->ne[1] < 2 &&
+    if (!plain_pair && !xmx_pair && !esimd_pair && wu->type != GGML_TYPE_Q4_K && wu->type != GGML_TYPE_Q6_K && !q4_0_ok && act->ne[1] < 2 &&
         !(wu->type == GGML_TYPE_PTQ1_0 && ggml_sycl_ptq1_0_glu_n1_enabled())) {
         return false;
     }

@@ -21,4 +21,9 @@ void ggml_sycl_rope_back(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
 void ggml_sycl_rope_fused(ggml_backend_sycl_context & ctx, ggml_tensor * dst, ggml_tensor * set_rows);
 
+// [a770-opt] ROPE(Q) + ROPE(K) -> K cache + V -> V cache in one launch; false if the shapes are not handled
+bool ggml_sycl_rope_qkv_cache(ggml_backend_sycl_context & ctx, ggml_tensor * rope_q, ggml_tensor * rope_k,
+                              ggml_tensor * set_rows_k, ggml_tensor * set_rows_v, const float * k_data = nullptr,
+                              const float * v_data = nullptr);
+
 #endif // GGML_SYCL_ROPE_HPP

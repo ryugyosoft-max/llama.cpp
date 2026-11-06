@@ -14,6 +14,7 @@
 // A second kernel merges the partials (O, L, M) of all splits.
 
 #include "fattn-xe1dec.hpp"
+#include "llama-xe1.hpp"
 
 #include <sycl/ext/oneapi/experimental/group_load_store.hpp>
 
@@ -443,7 +444,7 @@ static void xe1dec_kernel_q(const xe1dec_params p, const sycl::nd_item<3> & it, 
 
 // merge: workgroup = one head x 64 dims (x batch); split weights computed once into local memory
 static void xe1dec_reduce(const float * part, const float * sinks, float * dst, int D, int ne1, int ne2, int ne3, int k_num,
-                          const sycl::nd_item<3> & it, float * sh_w) {
+                          const sycl::nd_item<3> & it, float * sh_w, int8_t * q8 = nullptr, float * sh_o = nullptr) {
     const int n   = it.get_group(2);
     const int tid = it.get_local_id(2);
     const int i3  = it.get_group(0);
@@ -499,7 +500,19 @@ static void xe1dec_reduce(const float * part, const float * sinks, float * dst, 
     }
     float O = ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
     O *= ms * L;
-    dst[(int64_t) i3 * ne2 * ne1 * D + (int64_t) D * n + d] = sycl::clamp(O, -3.402823466e+38f, 3.402823466e+38f);
+    O = sycl::clamp(O, -3.402823466e+38f, 3.402823466e+38f);
+    dst[(int64_t) i3 * ne2 * ne1 * D + (int64_t) D * n + d] = O;
+    if (q8) {  // [a770-opt] single token, D % 64 == 0: also the q8_1 SoA copy for the output projection (llama-xe1)
+        sh_o[tid] = O;
+        sycl::group_barrier(grp);
+        const auto sg = it.get_sub_group();
+        const int  s  = sg.get_group_linear_id();
+        if (s < 2) {
+            const int lane = sg.get_local_linear_id();
+            const int blk  = (D * n + it.get_group(1) * 64) / 32 + s;
+            ggml_sycl_xe1_quant_block_store(sh_o[32 * s + 2 * lane], sh_o[32 * s + 2 * lane + 1], q8, D * ne1, blk, sg);
+        }
+    }
 }
 
 template <int D, int GQA, int DS>
@@ -533,6 +546,7 @@ static void launch_q(const xe1dec_params & p, int nkvh, int ne3, int wgs, dpct::
 template <int D, int DS, int KVT>
 static void launch_gqa_q(int gqa, const xe1dec_params & p, int nkvh, int ne3, int wgs, dpct::queue_ptr stream) {
     switch (gqa) {
+        case 1: launch_q<D, 1, DS, KVT>(p, nkvh, ne3, wgs, stream); break;  // [a770-opt] MHA (Llama 2)
         case 2: launch_q<D, 2, DS, KVT>(p, nkvh, ne3, wgs, stream); break;
         case 3: launch_q<D, 3, DS, KVT>(p, nkvh, ne3, wgs, stream); break;
         case 4: launch_q<D, 4, DS, KVT>(p, nkvh, ne3, wgs, stream); break;
@@ -547,6 +561,7 @@ static void launch_gqa_q(int gqa, const xe1dec_params & p, int nkvh, int ne3, in
 template <int D, int DS>
 static void launch_gqa(int gqa, const xe1dec_params & p, int nkvh, int ne3, int wgs, dpct::queue_ptr stream) {
     switch (gqa) {
+        case 1: launch<D, 1, DS>(p, nkvh, ne3, wgs, stream); break;  // [a770-opt] MHA (Llama 2)
         case 2: launch<D, 2, DS>(p, nkvh, ne3, wgs, stream); break;
         case 3: launch<D, 3, DS>(p, nkvh, ne3, wgs, stream); break;
         case 4: launch<D, 4, DS>(p, nkvh, ne3, wgs, stream); break;
@@ -602,7 +617,7 @@ bool ggml_sycl_flash_attn_ext_xe1dec_supported(int device, const ggml_tensor * d
         return false;
     }
     const int64_t gqa = Q->ne[2] / K->ne[2];
-    if (gqa < 2 || gqa > 8 || K->ne[2] != V->ne[2] || K->ne[3] != Q->ne[3] || V->ne[3] != Q->ne[3]) {
+    if (gqa < 1 || gqa > 8 || K->ne[2] != V->ne[2] || K->ne[3] != Q->ne[3] || V->ne[3] != Q->ne[3]) {
         return false;
     }
     if (mask && (mask->type != GGML_TYPE_F16 || mask->ne[0] < K->ne[1] || mask->ne[2] != 1 || mask->ne[1] < Q->ne[1] ||
@@ -637,7 +652,10 @@ void ggml_sycl_flash_attn_ext_xe1dec(ggml_backend_sycl_context & ctx, ggml_tenso
     float scale;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
 
-    static const int target_wg = getenv("GGML_SYCL_XE1DEC_WG") ? atoi(getenv("GGML_SYCL_XE1DEC_WG")) : 256;
+    // [a770-opt] split target: 256 work-groups suits few KV heads (GQA); MHA (Llama 2, 32 KV heads) is faster with 64
+    // (fewer partials to merge: 7B decode 90.1 -> 91.4 t/s at depth 0, 72.0 -> 73.8 at 2048)
+    static const int env_wg    = getenv("GGML_SYCL_XE1DEC_WG") ? atoi(getenv("GGML_SYCL_XE1DEC_WG")) : 0;
+    const int        target_wg = env_wg > 0 ? env_wg : (K->ne[2] >= 16 ? 64 : 256);
     const bool kv_q   = K->type != GGML_TYPE_F16;  // quantized kernels always use DS 4 (D 256) / 2 (D 128)
     const int R       = kv_q ? std::max(1, 16 / (gqa * (D == 256 ? 4 : 2))) : xe1dec_r(D, gqa);
     const int want    = std::max(2, (target_wg + nkvh * ne3 - 1) / (nkvh * ne3));
@@ -689,6 +707,26 @@ void ggml_sycl_flash_attn_ext_xe1dec(ggml_backend_sycl_context & ctx, ggml_tenso
     const float * sk = sinks ? (const float *) sinks->data : nullptr;
     float *       dd = (float *) dst->data;
     const int     ne2 = 1;  // query rows are folded into ne3
+    // [a770-opt] one decode token: the merge also writes the q8 copy the Q4_0 output projection reads (llama-xe1 stash)
+    int8_t * q8 = nullptr;
+    static const bool q8_on = ggml_sycl_knob("GGML_SYCL_XE1_FA_Q8", 1) && ggml_sycl_knob("GGML_SYCL_XE1_FUSE", 1);
+    if (q8_on && ne3 == 1 && D % 64 == 0 && ggml_is_contiguous(dst)) {
+        q8 = (int8_t *) ggml_sycl_xe1_stash_slot(stream, (size_t) D * ne1 + (size_t) D * ne1 / 32 * 4);
+    }
+    if (q8) {
+        stream->submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<float, 1> sh_w(sycl::range<1>(k_num), cgh);
+            sycl::local_accessor<float, 1> sh_o(sycl::range<1>(64), cgh);
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(ne3, D / 64, (size_t) ne1 * 64), sycl::range<3>(1, 1, 64)),
+                             [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] {
+                                 xe1dec_reduce(pp, sk, dd, D, ne1, ne2, ne3, k_num, it,
+                                               sh_w.get_multi_ptr<sycl::access::decorated::no>().get(), q8,
+                                               sh_o.get_multi_ptr<sycl::access::decorated::no>().get());
+                             });
+        });
+        ggml_sycl_xe1_stash_put(dst, q8);
+        return;
+    }
     stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<float, 1> sh_w(sycl::range<1>(k_num), cgh);
         cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(ne3, (D + 63) / 64, (size_t) ne1 * 64), sycl::range<3>(1, 1, 64)),
