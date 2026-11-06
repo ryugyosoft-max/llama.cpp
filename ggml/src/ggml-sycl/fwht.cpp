@@ -2,6 +2,9 @@
 #include "llama-xe1.hpp"
 #include "fattn-xe1dec.hpp"
 
+static void launch_fwht4096_wg1024(const float * src, float * dst, const int64_t n_rows, const float scale,
+                                   const float * signs, const int n_blk, dpct::queue_ptr stream);
+
 #include <cmath>
 #define P 1.0f
 #define N -1.0f
@@ -736,7 +739,12 @@ static bool fwht_run(ggml_backend_sycl_context & ctx, const ggml_tensor * src, g
         if (q8_on && rows <= 3) {  // one column of up to 12288 (FFN down: 3 rows) -> one mat-vec input
             q8 = (int8_t *) ggml_sycl_xe1_stash_slot(ctx.stream(), (size_t) rows * 4096 + rows * 128 * 4);
         }
-        launch_fwht4096((const float *) src->data, (float *) dst->data, rows, scale, signs, n_blk, q8, ctx.stream());
+        static const bool wg1024 = ggml_sycl_knob("GGML_SYCL_FWHT1024", 1) != 0;
+        if (wg1024 && !q8) {
+            launch_fwht4096_wg1024((const float *) src->data, (float *) dst->data, rows, scale, signs, n_blk, ctx.stream());
+        } else {
+            launch_fwht4096((const float *) src->data, (float *) dst->data, rows, scale, signs, n_blk, q8, ctx.stream());
+        }
         if (q8) {
             ggml_sycl_xe1_stash_put(dst->data, q8);
         }
@@ -749,6 +757,79 @@ static bool fwht_run(ggml_backend_sycl_context & ctx, const ggml_tensor * src, g
 }
 
 } // namespace fwht_signed_impl
+
+// [a770-opt] the 4096-point butterflies of one row held by a 1024-wide work-group, 4 values per work-item: in v[k] the
+// element k * 1024 + t; out: v[k] holds element lo4 | lane << 4 | k << 8 | hi2 << 10 (lo4 = (t >> 4) & 15, hi2 = t >> 8)
+static inline void fwht4096_wg1024(float (&v)[4], float * s, const sycl::nd_item<1> & it) {
+    const auto sg   = it.get_sub_group();
+    const int  t    = (int) it.get_local_id(0);
+    const int  lane = sg.get_local_linear_id();
+    auto reg2 = [&]() {
+#pragma unroll
+        for (int h = 1; h < 4; h *= 2) {
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                if ((k & h) == 0) {
+                    const float x = v[k], y = v[k + h];
+                    v[k] = x + y;
+                    v[k + h] = x - y;
+                }
+            }
+        }
+    };
+    auto lanes4 = [&]() {
+#pragma unroll
+        for (int h = 1; h < 16; h *= 2) {
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const float o = sycl::permute_group_by_xor(sg, v[k], h);
+                v[k] = (lane & h) == 0 ? v[k] + o : o - v[k];
+            }
+        }
+    };
+    auto pad = [](int i) { return i + (i >> 4); };
+    reg2();
+    lanes4();
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        s[pad(k * 1024 + t)] = v[k];
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+    const int lo4 = (t >> 4) & 15, hi2 = t >> 8;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        v[k] = s[pad(lo4 | (lane << 4) | (k << 8) | (hi2 << 10))];
+    }
+    lanes4();
+    reg2();
+}
+
+// standalone 4096-point rotation of up to a few rows (one 1024-wide work-group per row)
+static void launch_fwht4096_wg1024(const float * src, float * dst, const int64_t n_rows, const float scale,
+                                   const float * signs, const int n_blk, dpct::queue_ptr stream) {
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> sl(sycl::range<1>(4096 + 256), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(n_rows * 1024, 1024), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const int     r  = (int) it.get_group(0);
+            const int     t  = (int) it.get_local_id(0);
+            const float * sr = src + r * 4096;
+            const float * gr = signs ? signs + (r % n_blk) * 4096 : nullptr;
+            float         v[4];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const int i = k * 1024 + t;
+                v[k]        = sr[i] * scale * (gr ? gr[i] : 1.0f);
+            }
+            fwht4096_wg1024(v, sl.get_multi_ptr<sycl::access::decorated::no>().get(), it);
+            const int lane = it.get_sub_group().get_local_linear_id(), lo4 = (t >> 4) & 15, hi2 = t >> 8;
+            float *   dr   = dst + r * 4096;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                dr[lo4 | (lane << 4) | (k << 8) | (hi2 << 10)] = v[k];
+            }
+        });
+    });
+}
 
 // [a770-opt] one row of 4096: [residual add +] RMS norm * w + sign flip + 4096-point rotation in one work-group of
 // 1024 (4 values per work-item: few registers - a 256-wide version with 16 values plus four input streams spilled and
@@ -795,58 +876,8 @@ bool ggml_sycl_fwht4096_add_norm_rot(ggml_backend_sycl_context & ctx, const floa
                 }
                 v[k] = y * signs[i] * (1.0f / 64.0f);
             }
-            // bits 10..11 (registers)
-#pragma unroll
-            for (int h = 1; h < 4; h *= 2) {
-#pragma unroll
-                for (int k = 0; k < 4; ++k) {
-                    if ((k & h) == 0) {
-                        const float x = v[k], y = v[k + h];
-                        v[k] = x + y;
-                        v[k + h] = x - y;
-                    }
-                }
-            }
-            // bits 0..3 (lanes)
-#pragma unroll
-            for (int h = 1; h < 16; h *= 2) {
-#pragma unroll
-                for (int k = 0; k < 4; ++k) {
-                    const float o = sycl::permute_group_by_xor(sg, v[k], h);
-                    v[k] = (lane & h) == 0 ? v[k] + o : o - v[k];
-                }
-            }
-            auto pad = [](int i) { return i + (i >> 4); };  // one float of padding per 16: conflict-free strided reads
-#pragma unroll
-            for (int k = 0; k < 4; ++k) {
-                s[pad(k * 1024 + t)] = v[k];
-            }
-            it.barrier(sycl::access::fence_space::local_space);
-            // work-item t = (hi2 << 8) | (lo4 << 4) | lane' ... holds lo4 | lane' << 4 | k' << 8 | hi2 << 10
+            fwht4096_wg1024(v, s, it);
             const int lo4 = (t >> 4) & 15, hi2 = t >> 8;
-#pragma unroll
-            for (int k = 0; k < 4; ++k) {
-                v[k] = s[pad(lo4 | (lane << 4) | (k << 8) | (hi2 << 10))];
-            }
-#pragma unroll
-            for (int h = 1; h < 16; h *= 2) {  // bits 4..7 (lanes)
-#pragma unroll
-                for (int k = 0; k < 4; ++k) {
-                    const float o = sycl::permute_group_by_xor(sg, v[k], h);
-                    v[k] = (lane & h) == 0 ? v[k] + o : o - v[k];
-                }
-            }
-#pragma unroll
-            for (int h = 1; h < 4; h *= 2) {  // bits 8..9 (registers)
-#pragma unroll
-                for (int k = 0; k < 4; ++k) {
-                    if ((k & h) == 0) {
-                        const float x = v[k], y = v[k + h];
-                        v[k] = x + y;
-                        v[k + h] = x - y;
-                    }
-                }
-            }
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
                 dst[lo4 | (lane << 4) | (k << 8) | (hi2 << 10)] = v[k];
