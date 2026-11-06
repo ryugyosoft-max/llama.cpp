@@ -6243,8 +6243,49 @@ static bool ggml_sycl_wd_dnnl(ggml_backend_sycl_context & ctx, const ggml_tensor
 }
 #endif
 
+// [a770-opt] f32 weight x one f32 column (Qwen3.5 / Bonsai DeltaNet ssm_alpha / ssm_beta: 4096 x 32, 24 pairs per
+// token). F32 has no dmmv kernel, so these went through the GEMM path at ~14 us each; here one work-group with
+// 16-byte loads per row. GGML_SYCL_F32_MMV=0 restores the GEMM path.
+static bool ggml_sycl_f32_mmv(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                              ggml_tensor * dst) {
+    static const bool on = !getenv("GGML_SYCL_F32_MMV") || atoi(getenv("GGML_SYCL_F32_MMV")) != 0;
+    const int64_t K = src0->ne[0], N = src0->ne[1];
+    if (!on || dst->op != GGML_OP_MUL_MAT || src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 ||
+        dst->type != GGML_TYPE_F32 || src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || src0->ne[2] != 1 ||
+        src0->ne[3] != 1 || K % 64 != 0 || N > 65536 || !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) ||
+        !ggml_is_contiguous(dst) || ggml_backend_buffer_is_sycl_split(src0->buffer) ||
+        ((uintptr_t) src0->data % 16) != 0 || ((uintptr_t) src1->data % 16) != 0) {
+        return false;
+    }
+    const float * w = (const float *) src0->data;
+    const float * x = (const float *) src1->data;
+    float *       y = (float *) dst->data;
+    // one 256-wide work-group per row: every float4 load of the row is in flight at once (a sub-group per row walked
+    // 64 dependent iterations and made the model slower)
+    constexpr int WG = 256;
+    const int64_t K4 = K / 4;
+    ctx.stream()->parallel_for(sycl::nd_range<1>((size_t) N * WG, WG),
+        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            const int64_t        row = it.get_group(0);
+            const int            tid = it.get_local_id(0);
+            const sycl::float4 * wr  = (const sycl::float4 *) (w + row * K);
+            const sycl::float4 * xr  = (const sycl::float4 *) x;
+            float                acc = 0.0f;
+            for (int64_t i = tid; i < K4; i += WG) {
+                const sycl::float4 a = wr[i], b = xr[i];
+                acc += a.x() * b.x() + a.y() * b.y() + a.z() * b.z() + a.w() * b.w();
+            }
+            acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
+            if (tid == 0) {
+                y[row] = acc;
+            }
+        });
+    return true;
+}
+
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
+
 
     if (dst->op == GGML_OP_MUL_MAT && ggml_sycl_t2_mul_mat_try(ctx, src0, src1, dst)) {
         return;
@@ -6261,6 +6302,10 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         return;
     }
 
+    if (dst->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(dst, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+        ggml_sycl_f32_mmv(ctx, src0, src1, dst)) {
+        return;
+    }
     if (ggml_sycl_pq2_xmx_use(ctx, src0, src1, dst)) {
         ggml_sycl_pq2_xmx_mul_mat(ctx, src0, src1, dst);
         return;
@@ -7857,6 +7902,11 @@ struct sycl_op_timing {
             if (ggml_get_op_params_i32(n, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
                 return "MUL_MAT hadamard";
             }
+            static const bool shapes = getenv("GGML_SYCL_OP_TIMING_SHAPES") != nullptr;  // split mat-muls by weight shape
+            if (shapes) {
+                return std::string("MUL_MAT ") + ggml_type_name(n->src[0]->type) + " " + std::to_string(n->src[0]->ne[0]) +
+                       "x" + std::to_string(n->src[0]->ne[1]);
+            }
             return std::string("MUL_MAT ") + ggml_type_name(n->src[0]->type);
         }
         return ggml_op_desc(n);
@@ -7867,7 +7917,7 @@ struct sycl_op_timing {
         std::vector<std::pair<double, std::string>> v;
         for (auto & kv : per_op) v.push_back({ kv.second.first, kv.first });
         std::sort(v.rbegin(), v.rend());
-        for (size_t i = 0; i < v.size() && i < 16; ++i) {
+        for (size_t i = 0; i < v.size() && i < 24; ++i) {
             const auto & a = per_op[v[i].second];
             fprintf(stderr, "op-timing:   %-22s %.3f ms/graph (%.1f groups/graph, %.1f us each)\n", v[i].second.c_str(),
                     a.first / graphs, (double) a.second / graphs, 1000.0 * a.first / std::max(1L, a.second));
