@@ -17,6 +17,7 @@
 #include "llama-xe1.hpp"
 
 #include <sycl/ext/oneapi/experimental/group_load_store.hpp>
+#include <sycl/ext/intel/esimd.hpp>
 
 #include <cmath>
 #include <cstring>
@@ -590,15 +591,15 @@ bool ggml_sycl_device_is_alchemist(int device) {
            arch == gpu_arch::intel_gpu_dg2_g10 || arch == gpu_arch::intel_gpu_dg2_g11 || arch == gpu_arch::intel_gpu_dg2_g12;
 }
 
-bool ggml_sycl_flash_attn_ext_xe1dec_supported(int device, const ggml_tensor * dst) {
+static bool xe1dec_supported_impl(int device, const ggml_tensor * dst, int & why) {
     static const bool disabled = getenv("GGML_SYCL_XE1DEC_OFF") != nullptr;
     // the generic kernels lose even at a 256-token cache (180 vs ~90 us), so no minimum by default
     static const int  min_kv   = getenv("GGML_SYCL_XE1DEC_MIN_KV") ? atoi(getenv("GGML_SYCL_XE1DEC_MIN_KV")) : 0;
     if (disabled) {
-        return false;
+        return (why = 1, false);
     }
     if (!ggml_sycl_device_is_alchemist(device)) {
-        return false;
+        return (why = 2, false);
     }
     const ggml_tensor * Q = dst->src[0], * K = dst->src[1], * V = dst->src[2], * mask = dst->src[3], * sinks = dst->src[4];
     float max_bias = 0.0f, softcap = 0.0f;
@@ -608,23 +609,30 @@ bool ggml_sycl_flash_attn_ext_xe1dec_supported(int device, const ggml_tensor * d
     static const bool quant_off = getenv("GGML_SYCL_XE1DEC_QUANT_OFF") != nullptr;
     const bool kv_f16   = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
     const bool kv_quant = !quant_off && K->type == V->type && (K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q4_0);
-    if (Q->ne[1] < 1 || Q->ne[1] > 4 || Q->type != GGML_TYPE_F32 || !(kv_f16 || kv_quant) ||
+    // [a770-opt] the XMX path (quantized cache, long enough) also takes 5..16 tokens (a prompt's tail, which the
+    // generic kernels serve by dequantizing the whole cache: 13 tokens at 32K took 650 ms)
+    static const int xmx_min = getenv("GGML_SYCL_XE1X_MIN_KV") ? atoi(getenv("GGML_SYCL_XE1X_MIN_KV")) : 2048;
+    const int max_q = kv_quant && xmx_min > 0 && K->ne[1] >= xmx_min && Q->ne[2] / K->ne[2] <= 8 && Q->ne[3] == 1 ? 16 : 4;
+    if (Q->ne[1] < 1 || Q->ne[1] > max_q || Q->type != GGML_TYPE_F32 || !(kv_f16 || kv_quant) ||
         dst->type != GGML_TYPE_F32 || V->ne[0] != D || (D != 128 && D != 256) || K->ne[1] < min_kv ||
         max_bias != 0.0f || softcap != 0.0f || (sinks && sinks->type != GGML_TYPE_F32)) {
-        return false;
+        return (why = 3, false);
     }
     if (Q->ne[2] % K->ne[2] != 0) {
-        return false;
+        return (why = 4, false);
     }
     const int64_t gqa = Q->ne[2] / K->ne[2];
     if (gqa < 1 || gqa > 8 || K->ne[2] != V->ne[2] || K->ne[3] != Q->ne[3] || V->ne[3] != Q->ne[3]) {
-        return false;
+        return (why = 5, false);
     }
     if (mask && (mask->type != GGML_TYPE_F16 || mask->ne[0] < K->ne[1] || mask->ne[2] != 1 || mask->ne[1] < Q->ne[1] ||
                  mask->nb[1] % 2 != 0)) {
-        return false;
+        return (why = 6, false);
     }
     auto al16 = [](size_t x) { return x % 16 == 0; };
+    if (kv_quant && Q->ne[1] > 1 && !al16(Q->nb[1])) {
+        return (why = 9, false);
+    }
     if (kv_quant) {  // 2-block chunks read with 4-byte block reads
         auto al4 = [](size_t x) { return x % 4 == 0; };
         return al16(Q->nb[2]) && al16(Q->nb[3]) && al4(K->nb[1]) && al4(K->nb[2]) && al4(K->nb[3]) && al4(V->nb[1]) &&
@@ -632,11 +640,277 @@ bool ggml_sycl_flash_attn_ext_xe1dec_supported(int device, const ggml_tensor * d
                K->nb[0] == ggml_type_size(K->type) && ggml_is_contiguous(dst);
     }
     if (Q->ne[1] > 1 && !al16(Q->nb[1])) {
-        return false;
+        return (why = 7, false);
     }
     return al16(Q->nb[2]) && al16(Q->nb[3]) && al16(K->nb[1]) && al16(K->nb[2]) && al16(K->nb[3]) && al16(V->nb[1]) &&
            al16(V->nb[2]) && al16(V->nb[3]) && ggml_is_contiguous(dst);
 }
+
+// [a770-opt] GGML_SYCL_XE1DEC_WHY=1: print (once per reason) why a FLASH_ATTN_EXT is not taken, with its shapes
+bool ggml_sycl_flash_attn_ext_xe1dec_supported(int device, const ggml_tensor * dst) {
+    int why = 0;
+    const bool ok = xe1dec_supported_impl(device, dst, why);
+    static const bool dbg = getenv("GGML_SYCL_XE1DEC_WHY") && atoi(getenv("GGML_SYCL_XE1DEC_WHY"));
+    static uint64_t seen = 0;
+    const int key = why * 2 + (dst->src[0]->ne[1] <= 4 ? 1 : 0);
+    if (!ok && dbg && key < 64 && !(seen & (1ull << key))) {
+        seen |= 1ull << key;
+        const ggml_tensor * Q = dst->src[0], * K = dst->src[1], * V = dst->src[2], * m = dst->src[3];
+        fprintf(stderr, "xe1dec: declined (check %d) Q[%lld %lld %lld %lld] nb[%zu %zu %zu] K %s [%lld %lld %lld] nb[%zu %zu %zu] V %s nb[%zu %zu %zu] mask %s [%lld %lld] nb1 %zu\n",
+                why, (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
+                ggml_type_name(K->type), (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], K->nb[1], K->nb[2], K->nb[3],
+                ggml_type_name(V->type), V->nb[1], V->nb[2], V->nb[3], m ? ggml_type_name(m->type) : "-", m ? (long long) m->ne[0] : 0LL,
+                m ? (long long) m->ne[1] : 0LL, m ? m->nb[1] : (size_t) 0);
+    }
+    return ok;
+}
+
+// [a770-opt] Long-context decode on a quantized cache with the XMX units (ESIMD, DG2's 8-wide DPAS).
+// The vector kernels above are ALU-bound on q4_0 / q8_0 caches (Bonsai 27B at 32K: ~700 us per call, ~50 GB/s). Here
+// the GQA query heads sharing a KV head are the 8 columns of a DPAS: Q.K^T is an int8 DPAS (q8_0 K as s8, q4_0 K as
+// u4 with Q's 32 values permuted into the nibble order and the -8 offset folded in through sum(q)), P.V an f16 DPAS on
+// V dequantized once per KV head for all of them. A work-group = D/32 ESIMD threads (one 32-dim block each) over one KV
+// head and a slice of positions; the per-block Q.K^T partials meet in SLM every 16 positions. Output = xe1dec partials.
+namespace xe1x {
+namespace esimd = sycl::ext::intel::esimd;
+namespace xmx   = sycl::ext::intel::esimd::xmx;
+using xmx::dpas_argument_type;
+
+constexpr int TP = 16;  // positions per step (two 8-row DPAS for Q.K^T, one 16-deep DPAS per 8 dims for P.V)
+
+template <int KVT> struct kv;
+template <> struct kv<GGML_TYPE_Q4_0> { static constexpr int BB = 18, QD = 4, RD = 8;  };  // qs dwords, dwords read
+template <> struct kv<GGML_TYPE_Q8_0> { static constexpr int BB = 34, QD = 8, RD = 16; };
+
+// R rows of one block each: RD dwords from the dword-aligned start of the block (one LSC gather per 8 dwords x R
+// rows); returns the QD qs dwords per row (funnel-shifted when the block starts 2 bytes into a dword) and the scales
+// R rows of one block each: RD dwords from the dword-aligned start of the block, one LSC gather per 8 dwords x R rows.
+// A non-transposed LSC gather returns component-major data: dword k of address r at k * R + r. issue() only starts
+// the loads (the next step's rows are fetched while this one computes), finish() unpacks them.
+template <int KVT, int R>
+ESIMD_INLINE esimd::simd<uint32_t, R * kv<KVT>::RD> issue_rows(const char * base, esimd::simd<uint32_t, R> ro) {
+    using namespace esimd;
+    constexpr int RD = kv<KVT>::RD;
+    simd<uint32_t, R * RD> wc;
+#pragma unroll
+    for (int c = 0; c < RD / 8; ++c) {
+        wc.template select<R * 8, 1>(c * 8 * R) = gather<uint32_t, R * 8, 8>((const uint32_t *) base, ro + 32u * c);
+    }
+    return wc;
+}
+
+// odd block (starts 2 bytes into a dword, base = 2 bytes before it): scale = high half of dword 0, qs = dwords 1..
+// even block (dword aligned): scale = low half of dword 0, qs = (dword i >> 16) | (dword i + 1 << 16)
+template <int KVT, int R>
+ESIMD_INLINE void finish_rows(esimd::simd<uint32_t, R * kv<KVT>::RD> wc, const bool odd,
+                              esimd::simd<uint32_t, R * kv<KVT>::QD> & qs, esimd::simd<float, R> & d) {
+    using namespace esimd;
+    constexpr int QD = kv<KVT>::QD;
+    simd<uint32_t, R> w0 = wc.template select<R, 1>(0);
+    simd<uint16_t, R> sh = convert<uint16_t>(odd ? simd<uint32_t, R>(w0 >> 16) : simd<uint32_t, R>(w0 & 0xFFFFu));
+#pragma unroll
+    for (int i = 0; i < QD; ++i) {
+        simd<uint32_t, R> lo = wc.template select<R, 1>(i * R);
+        simd<uint32_t, R> hi = wc.template select<R, 1>((i + 1) * R);
+        qs.template select<R, QD>(i) = odd ? hi : simd<uint32_t, R>((lo >> 16) | (hi << 16));
+    }
+    d = convert<float>(sh.template bit_cast_view<sycl::half>().read());
+}
+
+template <int D, int KVT>
+ESIMD_INLINE void thread(const xe1dec_params p, const int gqa, const int kvh, const int split, const int iqt, const int tid) {
+    using namespace esimd;
+    constexpr int NT = D / 32;
+    constexpr int BB = kv<KVT>::BB, QD = kv<KVT>::QD, RD = kv<KVT>::RD;
+    slm_init<NT * TP * 8 * sizeof(float)>();
+
+    const int head0 = kvh * gqa;
+    simd<uint32_t, 64> bq = 0;
+    simd<float, 8>     dq = 0.0f, qs8 = 0.0f;
+#pragma unroll
+    for (int c = 0; c < 8; ++c) {
+        if (c < gqa) {
+            const float *    qp = (const float *) (p.q + (int64_t) iqt * p.nbq1 + (int64_t) (head0 + c) * p.nbq2) + tid * 32;
+            simd<float, 32>  qf = block_load<float, 32>(qp) * p.scale;
+            const float      am = hmax<float>(abs(qf));
+            const float      id = am > 0.0f ? 127.0f / am : 0.0f;
+            simd<float, 32>  qr = rnde<float, 32>(qf * id);
+            simd<int8_t, 32> qe;
+            if constexpr (KVT == GGML_TYPE_Q4_0) {  // u4 element 2j = byte j low = dim j, 2j+1 = high = dim j + 16
+                qe.template select<16, 2>(0) = convert<int8_t>(simd<float, 16>(qr.template select<16, 1>(0)));
+                qe.template select<16, 2>(1) = convert<int8_t>(simd<float, 16>(qr.template select<16, 1>(16)));
+            } else {
+                qe = convert<int8_t>(qr);
+            }
+            bq.template select<8, 8>(c) = qe.template bit_cast_view<uint32_t>().read();
+            dq[c]  = am / 127.0f;
+            qs8[c] = KVT == GGML_TYPE_Q4_0 ? 8.0f * reduce<float>(qr, std::plus<>()) : 0.0f;
+        }
+    }
+    const simd<float, 64> qs8r = qs8.template replicate<8>();  // [r][c]
+    const simd<float, 64> dqr  = dq.template replicate<8>();
+
+    const int    start = split * p.split_kv;
+    const int    end   = p.KV < start + p.split_kv ? p.KV : start + p.split_kv;
+    const bool   odd   = (tid * BB) % 4 != 0;  // the block starts 2 bytes into a dword (rows are 4-byte multiples)
+    const char * kb    = p.k + (int64_t) kvh * p.nbk2 + tid * BB + (odd ? -2 : 0);
+    const char * vb    = p.v + (int64_t) kvh * p.nbv2 + tid * BB + (odd ? -2 : 0);
+    const sycl::half * mb = p.m ? p.m + (int64_t) iqt * p.m_row : nullptr;
+
+    simd<float, 64> O[4];  // dims 8g + d, [d][c]
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        O[g] = 0.0f;
+    }
+    simd<float, 8> m_run = -3.402823466e+38f * 0.5f;
+    simd<float, 8> l_run = 0.0f;
+    const simd<uint32_t, TP> lane(0, 1);
+
+    for (int p0 = start; p0 < end; p0 += TP) {
+        simd<uint32_t, TP> pos = lane + p0;
+        simd_mask<TP>      ok  = pos < (uint32_t) end;
+        simd<uint32_t, TP> pc  = pos;
+        pc.merge(simd<uint32_t, TP>(end - 1), !ok);
+        // all loads of the step first: K, V (16 rows each), mask
+        simd<uint32_t, TP * RD> kw = issue_rows<KVT, TP>(kb, pc * (uint32_t) p.nbk1);
+        simd<uint32_t, TP * RD> vw = issue_rows<KVT, TP>(vb, pc * (uint32_t) p.nbv1);
+        simd<float, TP> mk = 0.0f;
+        if (mb) {
+            simd<uint16_t, TP> mh = gather<uint16_t, TP>((const uint16_t *) mb, pc * 2u);
+            mk = convert<float>(mh.template bit_cast_view<sycl::half>().read());
+        }
+        mk.merge(simd<float, TP>(-INFINITY), !ok);
+        simd<uint32_t, TP * QD> kq;
+        simd<float, TP>         dk;
+        finish_rows<KVT, TP>(kw, odd, kq, dk);
+
+        // Q.K^T for this block: [16 pos][8 c]
+        simd<float, TP * 8> sp;
+#pragma unroll
+        for (int h = 0; h < TP / 8; ++h) {
+            simd<uint32_t, 8 * QD> a = kq.template select<8 * QD, 1>(h * 8 * QD);
+            simd<int, 64> ci = 0;
+            if constexpr (KVT == GGML_TYPE_Q4_0) {
+                ci = xmx::dpas<8, 8, int, int, uint32_t, uint32_t, dpas_argument_type::s8, dpas_argument_type::u4>(ci, bq, a);
+            } else {
+                ci = xmx::dpas<8, 8, int, int, uint32_t, uint32_t, dpas_argument_type::s8, dpas_argument_type::s8>(ci, bq, a);
+            }
+            simd<float, 8> dkh = dk.template select<8, 1>(8 * h);
+            sp.template select<64, 1>(64 * h) = (convert<float>(ci) - qs8r) * dqr * dkh.template replicate_vs_w_hs<8, 1, 8, 0>(0);
+        }
+        slm_block_store<float, TP * 8>(tid * TP * 8 * sizeof(float), sp);
+        barrier();
+        simd<float, TP * 8> s = slm_block_load<float, TP * 8>(0);
+#pragma unroll
+        for (int t = 1; t < NT; ++t) {
+            s += slm_block_load<float, TP * 8>(t * TP * 8 * sizeof(float));
+        }
+        barrier();
+
+        // masked positions (-inf) may hold garbage K / V (unwritten cache slots): their scores are set, not added to,
+        // and their V scales zeroed, so a NaN / inf there cannot reach the sums (0 * inf in the DPAS)
+        const simd<float, TP * 8> mkr = mk.template replicate_vs_w_hs<TP, 1, 8, 0>(0);
+        s += mkr;
+        s.merge(simd<float, TP * 8>(-INFINITY), mkr == -INFINITY);
+        simd<float, 64> m64 = max(simd<float, 64>(s.template select<64, 1>(0)), simd<float, 64>(s.template select<64, 1>(64)));
+        simd<float, 32> m32 = max(simd<float, 32>(m64.template select<32, 1>(0)), simd<float, 32>(m64.template select<32, 1>(32)));
+        simd<float, 16> m16 = max(simd<float, 16>(m32.template select<16, 1>(0)), simd<float, 16>(m32.template select<16, 1>(16)));
+        simd<float, 8>  mx  = max(simd<float, 8>(m16.template select<8, 1>(0)), simd<float, 8>(m16.template select<8, 1>(8)));
+        const simd<float, 8> m_new = max(m_run, mx);
+        const simd<float, 8> so    = exp(m_run - m_new);
+        s = exp(s - m_new.template replicate<TP>());
+        simd<float, 64> s64 = simd<float, 64>(s.template select<64, 1>(0)) + simd<float, 64>(s.template select<64, 1>(64));
+        simd<float, 32> s32 = simd<float, 32>(s64.template select<32, 1>(0)) + simd<float, 32>(s64.template select<32, 1>(32));
+        simd<float, 16> s16 = simd<float, 16>(s32.template select<16, 1>(0)) + simd<float, 16>(s32.template select<16, 1>(16));
+        l_run = l_run * so + (simd<float, 8>(s16.template select<8, 1>(0)) + simd<float, 8>(s16.template select<8, 1>(8)));
+        m_run = m_new;
+        const simd<float, 64> sor = so.template replicate<8>();  // O is [d][c]
+#pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            O[g] *= sor;
+        }
+
+        // B = P [16 pos][8 c] in VNNI pairs of positions: halfs (kp, c, j) = P[2kp + j][c]
+        simd<sycl::half, TP * 8> ph = convert<sycl::half>(s);
+        simd<sycl::half, TP * 8> pb;
+#pragma unroll
+        for (int kp = 0; kp < TP / 2; ++kp) {
+            pb.template select<8, 2>(kp * 16)     = ph.template select<8, 1>((2 * kp) * 8);
+            pb.template select<8, 2>(kp * 16 + 1) = ph.template select<8, 1>((2 * kp + 1) * 8);
+        }
+        const simd<uint32_t, 64> pb32 = pb.template bit_cast_view<uint32_t>().read();
+
+        // V block dequantized to f16 [pos][32 dims], A_g = V^T rows of dims 8g..8g+7 x 16 positions
+        simd<uint32_t, TP * QD> vq;
+        simd<float, TP>         dv;
+        finish_rows<KVT, TP>(vw, odd, vq, dv);
+        simd<sycl::half, TP * 32> vh;
+        if constexpr (KVT == GGML_TYPE_Q4_0) {
+            simd<uint8_t, TP * 16> vbytes = vq.template bit_cast_view<uint8_t>().read();
+            simd<sycl::half, TP * 16> lo = convert<sycl::half>(simd<int16_t, TP * 16>(vbytes & 0xF) - 8);
+            simd<sycl::half, TP * 16> hi = convert<sycl::half>(simd<int16_t, TP * 16>(vbytes >> 4) - 8);
+#pragma unroll
+            for (int r = 0; r < TP; ++r) {
+                vh.template select<16, 1>(r * 32)      = lo.template select<16, 1>(r * 16);
+                vh.template select<16, 1>(r * 32 + 16) = hi.template select<16, 1>(r * 16);
+            }
+        } else {
+            simd<int8_t, TP * 32> vbytes = vq.template bit_cast_view<int8_t>().read();
+            vh = convert<sycl::half>(vbytes);
+        }
+        simd<float, TP> dvz = dv;
+        dvz.merge(simd<float, TP>(0.0f), mk == -INFINITY);
+        vh *= convert<sycl::half>(dvz).template replicate_vs_w_hs<TP, 1, 32, 0>(0);
+        vh.merge(simd<sycl::half, TP * 32>(0.0f), convert<sycl::half>(dvz).template replicate_vs_w_hs<TP, 1, 32, 0>(0) == 0.0f);
+#pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            simd<sycl::half, 8 * TP> av;
+#pragma unroll
+            for (int d = 0; d < 8; ++d) {
+                av.template select<TP, 1>(d * TP) = vh.template select<TP, 32>(8 * g + d);
+            }
+            O[g] = xmx::dpas<8, 8, float, float, uint32_t, uint32_t, dpas_argument_type::fp16, dpas_argument_type::fp16>(
+                O[g], pb32, av.template bit_cast_view<uint32_t>().read());
+        }
+    }
+
+    // partials in the xe1dec layout (split = osplit, one query row): O unnormalised, then l and m per head
+#pragma unroll
+    for (int c = 0; c < 8; ++c) {
+        if (c < gqa) {
+            float * op = p.part + ((int64_t) (split + p.k_num * iqt) * p.ne1 + head0 + c) * D + tid * 32;
+#pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                block_store<float, 8>(op + 8 * g, simd<float, 8>(O[g].template select<8, 8>(c)));
+            }
+        }
+    }
+    if (tid == 0) {
+        const int64_t n_o = (int64_t) D * p.ne1 * p.k_num;
+        const int64_t n_o_all = n_o * p.nq;  // partials of all query rows come first
+        float *       lm  = p.part + n_o_all + (int64_t) (split + p.k_num * iqt) * 2 * p.ne1;
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            if (c < gqa) {
+                lm[head0 + c]         = l_run[c];
+                lm[p.ne1 + head0 + c] = m_run[c];
+            }
+        }
+    }
+}
+
+template <int D, int KVT>
+static void launch(const xe1dec_params & p, int gqa, int nkvh, int nsplit, dpct::queue_ptr stream) {
+    constexpr int NT = D / 32;
+    const int     nq = p.nq;  // one work-group per query token (MTP verification re-reads the cache per token)
+    stream->parallel_for(sycl::nd_range<1>((size_t) nkvh * nsplit * nq * NT, NT), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+        int g = (int) it.get_group(0);
+        const int kvh = g % nkvh;
+        g /= nkvh;
+        thread<D, KVT>(p, gqa, kvh, g % nsplit, g / nsplit, (int) it.get_local_id(0));
+    });
+}
+}  // namespace xe1x
 
 void ggml_sycl_flash_attn_ext_xe1dec(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0], * K = dst->src[1], * V = dst->src[2], * mask = dst->src[3], * sinks = dst->src[4];
@@ -663,7 +937,19 @@ void ggml_sycl_flash_attn_ext_xe1dec(ggml_backend_sycl_context & ctx, ggml_tenso
     int split_kv      = (KV + nsplit - 1) / nsplit;
     split_kv          = (split_kv + 15) / 16 * 16;
     const int wgs     = (KV + split_kv - 1) / split_kv;
-    const int k_num   = wgs * R;
+    int       k_num   = wgs * R;
+
+    // [a770-opt] XMX path: one decode token, quantized cache, <= 8 query heads per KV head, long enough cache
+    static const int xmx_min = getenv("GGML_SYCL_XE1X_MIN_KV") ? atoi(getenv("GGML_SYCL_XE1X_MIN_KV")) : 2048;
+    const bool use_xmx = kv_q && xmx_min > 0 && ne3 == nq && KV >= xmx_min && gqa <= 8;  // batch 1, 1-16 tokens
+    GGML_ASSERT(use_xmx || nq <= 4);
+    if (use_xmx) {
+        // positions per work-group (GGML_SYCL_XE1X_SPLIT); partials as xe1dec with R = 1
+        static const int per = getenv("GGML_SYCL_XE1X_SPLIT") ? atoi(getenv("GGML_SYCL_XE1X_SPLIT")) : 256;
+        int ns   = std::min(2048, std::max(2, (KV + per - 1) / per));
+        split_kv = ((KV + ns - 1) / ns + xe1x::TP - 1) / xe1x::TP * xe1x::TP;
+        k_num    = (KV + split_kv - 1) / split_kv;
+    }
 
     ggml_sycl_pool_alloc<float> part(ctx.pool(), ((size_t) D * ne1 + 2 * ne1) * k_num * ne3);
 
@@ -683,6 +969,14 @@ void ggml_sycl_flash_attn_ext_xe1dec(ggml_backend_sycl_context & ctx, ggml_tenso
 
     if (getenv("GGML_SYCL_XE1DEC_DBG") && atoi(getenv("GGML_SYCL_XE1DEC_DBG")) == 2) {
         // timing only: merge without the partial kernel
+    } else if (use_xmx) {
+        if (K->type == GGML_TYPE_Q4_0) {
+            D == 256 ? xe1x::launch<256, GGML_TYPE_Q4_0>(p, gqa, nkvh, k_num, stream)
+                     : xe1x::launch<128, GGML_TYPE_Q4_0>(p, gqa, nkvh, k_num, stream);
+        } else {
+            D == 256 ? xe1x::launch<256, GGML_TYPE_Q8_0>(p, gqa, nkvh, k_num, stream)
+                     : xe1x::launch<128, GGML_TYPE_Q8_0>(p, gqa, nkvh, k_num, stream);
+        }
     } else if (K->type == GGML_TYPE_Q8_0) {
         if (D == 256) { launch_gqa_q<256, 4, GGML_TYPE_Q8_0>(gqa, p, nkvh, ne3, wgs, stream); }
         else          { launch_gqa_q<128, 2, GGML_TYPE_Q8_0>(gqa, p, nkvh, ne3, wgs, stream); }

@@ -116,12 +116,14 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
     if(!g_ggml_sycl_enable_flash_attention) return BEST_FATTN_KERNEL_NONE;
 
+    // [a770-opt] Alchemist decode kernel first: the ARC-LAB DEC kernel below also takes q4_0 caches and used to win
+    // the dispatch for them (Bonsai 27B, q4_0 KV at 32K: DEC 736 us per call)
+    if (ggml_sycl_flash_attn_ext_xe1dec_supported(device, dst)) {
+        return BEST_FATTN_KERNEL_XE1DEC;
+    }
     // ARC-LAB: generation / MTP-verify batches on a q4_0 cache read it directly (TILE dequantizes the whole cache per call)
     if (ggml_sycl_flash_attn_ext_dec_supported(dst)) {
         return BEST_FATTN_KERNEL_DEC;
-    }
-    if (ggml_sycl_flash_attn_ext_xe1dec_supported(device, dst)) {
-        return BEST_FATTN_KERNEL_XE1DEC;
     }
 
     const ggml_tensor * KQV   = dst;
