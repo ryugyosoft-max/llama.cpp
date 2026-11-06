@@ -1289,12 +1289,92 @@ static void launch_ptq1_0_pairs_glu(const void * vup, const void * vgate, const 
     });
 }
 
+// [a770-opt] Arc Alchemist: the multi-matrix and gate/up+GLU launches with the per-lane-block core (one sub-group per
+// row, a lane per 128-weight block, reorder_vec_dot_q_sycl<PTQ1_0>), the kernel that wins single mat-vecs there; the
+// pairs core above is ~20% slower per byte on Alchemist. Merging saves the launch of every extra member (~3-5 us of
+// dependent-kernel cost each on the A770) and the re-quantization of the shared activation.
+static inline float ptq1_0_lb_row(const void * __restrict__ vx, const void * __restrict__ vy, const int ncols,
+                                  const int nrows, const int row, const int lane) {
+    using block_type = ggml_sycl_reordered::block_q_t<GGML_TYPE_PTQ1_0>;
+    const int bpr     = ncols / QK_PTQ1_0;
+    const int nblocks = nrows * bpr;
+    float     sum     = 0.0f;
+    for (int i = lane; i < bpr; i += WARP_SIZE) {
+        const int  ibx       = row * bpr + i;
+        const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
+        const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+        const int  iby       = i * block_type::block_to_q8_1_ratio();
+        const int8_t *      q8 = (const int8_t *) vy + iby * QK8_1;
+        const sycl::half2 * ds = (const sycl::half2 *) ((const char *) vy + ncols + iby * sizeof(sycl::half2));
+        sum += reorder_vec_dot_q_sycl<GGML_TYPE_PTQ1_0>()(vx, bx_offset, d_offset, q8, ds, 0);
+    }
+    return sum;
+}
+
+static void launch_ptq1_0_lb_multi(const void * const * vx, float * const * dst, const int * nrows, const int nm,
+                                   const void * vy, const int ncols, dpct::queue_ptr stream) {
+    const void * x0 = vx[0], * x1 = vx[1], * x2 = nm > 2 ? vx[2] : nullptr;
+    float *      d0 = dst[0], * d1 = dst[1], * d2 = nm > 2 ? dst[2] : nullptr;
+    const int    n0 = nrows[0], n1 = nrows[1], n2 = nm > 2 ? nrows[2] : 0;
+    const int    total = n0 + n1 + n2;
+    constexpr int NSG  = WARP_SIZE;  // sub-groups (rows) per work-group, as the single-matrix launch
+    const int     nwg  = ceil_div(total, NSG);
+    stream->parallel_for(sycl::nd_range<1>((size_t) nwg * NSG * WARP_SIZE, NSG * WARP_SIZE),
+        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            const auto sg  = it.get_sub_group();
+            int        row = (int) it.get_group(0) * NSG + sg.get_group_linear_id();
+            if (row >= total) {
+                return;
+            }
+            const void * x = x0;
+            float *      d = d0;
+            int          n = n0;
+            if (row >= n0) {
+                row -= n0;
+                x = x1; d = d1; n = n1;
+                if (row >= n1) {
+                    row -= n1;
+                    x = x2; d = d2; n = n2;
+                }
+            }
+            const float s = sycl::reduce_over_group(sg, ptq1_0_lb_row(x, vy, ncols, n, row, sg.get_local_linear_id()),
+                                                    std::plus<>());
+            if (sg.leader()) {
+                d[row] = s;
+            }
+        });
+}
+
+static void launch_ptq1_0_lb_glu(const void * vup, const void * vgate, const void * vy, float * dst, const int ncols,
+                                 const int nrows, const ggml_glu_op glu_op, dpct::queue_ptr stream) {
+    constexpr int NSG = WARP_SIZE;
+    const int     nwg = ceil_div(nrows, NSG);
+    stream->parallel_for(sycl::nd_range<1>((size_t) nwg * NSG * WARP_SIZE, NSG * WARP_SIZE),
+        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            const auto sg  = it.get_sub_group();
+            const int  row = (int) it.get_group(0) * NSG + sg.get_group_linear_id();
+            if (row >= nrows) {
+                return;
+            }
+            const int   lane = sg.get_local_linear_id();
+            const float u    = sycl::reduce_over_group(sg, ptq1_0_lb_row(vup, vy, ncols, nrows, row, lane), std::plus<>());
+            const float g    = sycl::reduce_over_group(sg, ptq1_0_lb_row(vgate, vy, ncols, nrows, row, lane), std::plus<>());
+            if (sg.leader()) {
+                dst[row] = u * (glu_op == GGML_GLU_OP_SWIGLU ? op_silu(g) : op_gelu(g));
+            }
+        });
+}
+
 // ARC-LAB: n matrices (<= 3) sharing one SoA-quantized activation column, one launch. False = caller runs them apart.
 bool ggml_sycl_ptq1_0_mul_mat_vec_multi(const void * const * vx, float * const * dst, const int * nrows, const int nm,
                                         const void * vy, const int ncols, dpct::queue_ptr stream) {
     constexpr int NR = 4;
     if (nm < 2 || nm > 3 || ncols % QK_PTQ1_0 != 0) {
         return false;
+    }
+    if (ggml_sycl_device_is_alchemist(ggml_sycl_get_device())) {
+        launch_ptq1_0_lb_multi(vx, dst, nrows, nm, vy, ncols, stream);
+        return true;
     }
     ptq1_0_multi_args a = {};
     int total = 0;
@@ -5125,6 +5205,10 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu
             return mul_mat_vec_q_glu_reorder_type<GGML_TYPE_Q6_K>(glu_op, vx, vgate, vy, dst, ncols, nrows, ncols_dst,
                                                                   stride_col_y_bytes, stride_col_dst, stream);
         case GGML_TYPE_PTQ1_0:
+            if (ncols_dst == 1 && ggml_sycl_ptq1_0_glu_n1_enabled() && ggml_sycl_device_is_alchemist(ggml_sycl_get_device())) {
+                launch_ptq1_0_lb_glu(vx, vgate, vy, dst, ncols, nrows, glu_op, stream);  // [a770-opt]
+                return true;
+            }
             if (ncols_dst == 1 && ggml_sycl_ptq1_0_glu_n1_enabled()) {
                 static const int glu_nr = getenv("GGML_SYCL_PTQ1_GLU1_NR") ? atoi(getenv("GGML_SYCL_PTQ1_GLU1_NR")) : 2;
                 if (glu_nr == 4) {

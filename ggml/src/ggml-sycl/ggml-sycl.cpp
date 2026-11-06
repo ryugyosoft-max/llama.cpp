@@ -3983,6 +3983,23 @@ static void ggml_sycl_set_peer_access(const int n_tokens, [[maybe_unused]] int m
     peer_access_enabled = enable_peer_access;
 }
 
+// [a770-opt] the q8_1 SoA copy a 4096-point rotation wrote beside its f32 output (fwht.cpp fwht4096_kernel), when act
+// is that output (directly or through a reshape/view at offset 0) and is consumed as one column
+static const void * ggml_sycl_rot_q8(const ggml_tensor * act) {
+    if (act->ne[1] != 1 || act->ne[2] != 1 || act->ne[3] != 1 || act->type != GGML_TYPE_F32 || act->ne[0] % 512 != 0) {
+        return nullptr;
+    }
+    const ggml_tensor * t = act;
+    while (t->view_src) {
+        t = t->view_src;
+    }
+    if (t->data != act->data || t->op != GGML_OP_MUL_MAT || ggml_get_op_params_i32(t, 1) != GGML_HINT_SRC0_IS_HADAMARD ||
+        ggml_nelements(t) != act->ne[0]) {
+        return nullptr;
+    }
+    return ggml_sycl_xe1_stash_get(t->data);
+}
+
 template <template <int> typename quantize_f>
 static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
                                  const ggml_tensor *src1, ggml_tensor *dst,
@@ -4108,6 +4125,15 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
         }
 
         if constexpr(quantize_enabled) {
+            const void * rot_q8 = nullptr;
+            if constexpr (std::is_same_v<quantize_f<1>, quantize_and_reorder_q8_1_soa<1>>) {
+                if (!split && nrows1 == 1 && src1_padded_col_size == ne10) {
+                    rot_q8 = ggml_sycl_rot_q8(src1);
+                }
+            }
+            if (rot_q8) {
+                dev[i].src1_ddq = (char *) rot_q8;  // [a770-opt] quantized by the rotation that produced src1
+            } else {
             dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs);
 
             if (src1_on_device && src1_is_contiguous) {
@@ -4120,6 +4146,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                               << ", line:" << __LINE__ << std::endl;
                     std::exit(1);
                 }
+            }
             }
         }
 
@@ -6636,7 +6663,9 @@ static bool ggml_sycl_mul_mat_glu_fused(ggml_backend_sycl_context & ctx, ggml_cg
     // quant pairs the reorder kernel does not serve (mixed gate/up types, q5_K off BMG) take the
     // standard-layout fused path instead; same-type q4_K / q5_K keep the reorder path below
     const bool reorder_pair = wg->type == wu->type &&
-        (wu->type == GGML_TYPE_Q4_K || (wu->type == GGML_TYPE_Q5_K && ggml_sycl_q5_k_mmvq_reuse(ctx.device)));
+        (wu->type == GGML_TYPE_Q4_K || (wu->type == GGML_TYPE_Q5_K && ggml_sycl_q5_k_mmvq_reuse(ctx.device)) ||
+         (wu->type == GGML_TYPE_PTQ1_0 && act->ne[1] == 1 && ggml_sycl_device_is_alchemist(ctx.device) &&
+          ggml_sycl_knob("GGML_SYCL_PTQ1_GLU_LB", 1)));  // [a770-opt] mmvq.cpp launch_ptq1_0_lb_glu
     if (!reorder_pair) {
         const auto is_plain_type = [](ggml_type type) {
             return type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS;
@@ -6678,7 +6707,10 @@ static bool ggml_sycl_mul_mat_glu_fused(ggml_backend_sycl_context & ctx, ggml_cg
                                              (size_t) ne11 * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
     char *                     src1_ddq = src1_q8_alloc.get();
 
-    if (wu->type == GGML_TYPE_PTQ1_0 && ggml_sycl_ptq1_0_ncols_dec_enabled() && ne11 <= 8 &&
+    const void * rot_q8 = wu->type == GGML_TYPE_PTQ1_0 && ne11 == 1 && src1_padded_cols == ne00 ? ggml_sycl_rot_q8(act) : nullptr;
+    if (rot_q8) {
+        src1_ddq = (char *) rot_q8;  // [a770-opt] quantized by the rotation that produced act
+    } else if (wu->type == GGML_TYPE_PTQ1_0 && ggml_sycl_ptq1_0_ncols_dec_enabled() && ne11 <= 8 &&
         !(ne11 == 1 && ggml_sycl_ptq1_0_glu_n1_enabled())) {
         // ARC-LAB: the decode-once PTQ1_0 fused kernel reads the chunk-interleaved activation layout
         quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_ptq1_il>((const float *) act->data, src1_ddq, (int) ne00,
@@ -8233,10 +8265,9 @@ static float * ggml_sycl_ptq1_multi_slot(queue_ptr stream) {
 
 static bool ggml_sycl_try_ptq1_multi(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i,
                                      std::vector<uint8_t> & done, std::vector<const void *> & pending) {
-    // [a770-opt] off by default on Arc Alchemist: its pairs core (NR 4, SIMD16 scalar loads, spills) loses to separate
-    // per-lane-block mat-vecs there (9B PTQ1_0 decode 82.4 -> 88.0 t/s, 27B 35.2 -> 36.3)
-    static const bool on  = getenv("GGML_SYCL_PTQ1_MULTI") ? atoi(getenv("GGML_SYCL_PTQ1_MULTI")) != 0
-                                                           : !ggml_sycl_device_is_alchemist(ctx.device);
+    // [a770-opt] on Arc Alchemist the merged launch runs the per-lane-block core (mmvq.cpp launch_ptq1_0_lb_multi); with
+    // the pairs core it lost to separate mat-vecs there (9B PTQ1_0 decode 82.4 vs 88.0 t/s)
+    static const bool on  = getenv("GGML_SYCL_PTQ1_MULTI") ? atoi(getenv("GGML_SYCL_PTQ1_MULTI")) != 0 : true;
     static int        log = getenv("GGML_SYCL_PTQ1_MULTI_LOG") ? atoi(getenv("GGML_SYCL_PTQ1_MULTI_LOG")) : 0;
     ggml_tensor * mm0 = cgraph->nodes[i];
     if (!on || !ggml_sycl_ptq1_multi_eligible(ctx, mm0)) {
@@ -8285,8 +8316,16 @@ static bool ggml_sycl_try_ptq1_multi(ggml_backend_sycl_context & ctx, ggml_cgrap
     const int     src1_padded_cols = GGML_PAD((int) ne00, MATRIX_ROW_PADDING);
     const int     stride_y_bytes   = src1_padded_cols * (int) sizeof(block_q8_1) / QK8_1;
     const queue_ptr stream         = ctx.stream();
-    ggml_sycl_pool_alloc<char> q8(ctx.pool(), (size_t) ne11 * stride_y_bytes);
-    if (ne11 == 1) {
+    ggml_sycl_pool_alloc<char> q8(ctx.pool());
+    const void * rot_q8 = ne11 == 1 && src1_padded_cols == ne00 ? ggml_sycl_rot_q8(act) : nullptr;
+    const void * vy_q8  = rot_q8;
+    if (!rot_q8) {
+        q8.alloc((size_t) ne11 * stride_y_bytes);
+        vy_q8 = q8.get();
+    }
+    if (rot_q8) {
+        // [a770-opt] quantized by the rotation that produced act
+    } else if (ne11 == 1) {
         quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>((const float *) act->data, q8.get(), (int) ne00, 1,
                                                               src1_padded_cols, stream);
     } else {
@@ -8309,7 +8348,7 @@ static bool ggml_sycl_try_ptq1_multi(ggml_backend_sycl_context & ctx, ggml_cgrap
         }
     }
     const bool launched = ne11 == 1 ?
-        ggml_sycl_ptq1_0_mul_mat_vec_multi(vx, dst, nrows, nm, q8.get(), (int) ne00, stream) :
+        ggml_sycl_ptq1_0_mul_mat_vec_multi(vx, dst, nrows, nm, vy_q8, (int) ne00, stream) :
         ggml_sycl_ptq1_0_mul_mat_vec_multi_ncols(vx, dst, nrows, nm, q8.get(), (int) ne00, ne11, stride_y_bytes, stream);
     if (!launched) {
         return false;
@@ -9054,8 +9093,8 @@ static bool ggml_sycl_try_dn_gates(ggml_backend_sycl_context & ctx, ggml_cgraph 
         return false;
     }
     ggml_tensor * const * n = cgraph->nodes + i;
-    static int dbg = getenv("GGML_SYCL_DN_GATES_DEBUG") ? 6 : 0;
-    const bool bf16_mm = n[0]->src[0] && n[0]->src[0]->type == GGML_TYPE_BF16;
+    static int dbg = getenv("GGML_SYCL_DN_GATES_DEBUG") ? atoi(getenv("GGML_SYCL_DN_GATES_DEBUG")) : 0;
+    const bool bf16_mm = n[0]->src[0] && (n[0]->src[0]->type == GGML_TYPE_BF16 || n[0]->src[0]->type == GGML_TYPE_F32);
     auto why = [&](const char * r) {
         if (dbg > 0 && bf16_mm) {
             --dbg;
@@ -9085,7 +9124,9 @@ static bool ggml_sycl_try_dn_gates(ggml_backend_sycl_context & ctx, ggml_cgraph 
     const ggml_tensor * sa   = n[4]->src[1];
     const int64_t K = wa->ne[0], R = wa->ne[1], M = x->ne[1] * x->ne[2];
     auto f32c = [](const ggml_tensor * t) { return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t); };
-    if (wa->type != GGML_TYPE_BF16 || wb->type != GGML_TYPE_BF16 || !ggml_is_contiguous(wa) || !ggml_is_contiguous(wb) ||
+    // [a770-opt] F32 weights too (Bonsai 2 / prism Qwen3.5 keep ssm_alpha / ssm_beta in F32)
+    const bool wf32 = wa->type == GGML_TYPE_F32;
+    if ((wa->type != GGML_TYPE_BF16 && wa->type != GGML_TYPE_F32) || wb->type != wa->type || !ggml_is_contiguous(wa) || !ggml_is_contiguous(wb) ||
         wb->ne[0] != K || wb->ne[1] != R || !f32c(x) || x->ne[0] != K || x->ne[3] != 1 || M < 1 || M > 8 || K % 8 != 0 ||
         !f32c(bias) || ggml_nelements(bias) != R || !f32c(sa) || ggml_nelements(sa) != R || !f32c(n[4]) || !f32c(n[8]) ||
         ggml_nelements(n[4]) != R * M || ggml_nelements(n[8]) != R * M || !f32c(n[0]) || !f32c(n[6])) {
@@ -9129,14 +9170,21 @@ static bool ggml_sycl_try_dn_gates(ggml_backend_sycl_context & ctx, ggml_cgraph 
         const int        g   = it.get_group(0);
         const bool       isb = g >= Ri;
         const int        row = isb ? g - Ri : g;
-        const uint16_t * w   = (isb ? pb : pa) + (size_t) row * Ki;
+        const uint16_t * w   = wf32 ? nullptr : (isb ? pb : pa) + (size_t) row * Ki;
         const int        tid = it.get_local_id(0);
         float            acc[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
         for (int k = tid * 8; k < Ki; k += WG * 8) {
-            const sycl::vec<uint16_t, 8> wv = *(const sycl::vec<uint16_t, 8> *) (w + k);
             float wf[8];
+            if (wf32) {
+                const float * wr = (const float *) (isb ? pb : pa) + (size_t) row * Ki + k;
+                const sycl::float4 w0 = *(const sycl::float4 *) wr, w1 = *(const sycl::float4 *) (wr + 4);
+                wf[0] = w0.x(); wf[1] = w0.y(); wf[2] = w0.z(); wf[3] = w0.w();
+                wf[4] = w1.x(); wf[5] = w1.y(); wf[6] = w1.z(); wf[7] = w1.w();
+            } else {
+                const sycl::vec<uint16_t, 8> wv = *(const sycl::vec<uint16_t, 8> *) (w + k);
 #pragma unroll
-            for (int j = 0; j < 8; ++j) wf[j] = sycl::bit_cast<float>((uint32_t) wv[j] << 16);
+                for (int j = 0; j < 8; ++j) wf[j] = sycl::bit_cast<float>((uint32_t) wv[j] << 16);
+            }
             for (int m = 0; m < Mi; ++m) {
                 const float * xr = px + (size_t) m * Ki + k;
 #pragma unroll

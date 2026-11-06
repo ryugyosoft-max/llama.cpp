@@ -59,6 +59,16 @@ const void * ggml_sycl_xe1_stash_get(const void * f32) {
     return nullptr;
 }
 
+void ggml_sycl_xe1_stash_drop_range(const void * p, size_t n) {
+    const char * a = (const char *) p;
+    for (auto & e : g_stash) {
+        const char * f = (const char *) e.f32;
+        if (f && f >= a && f < a + n) {
+            e = {};
+        }
+    }
+}
+
 void ggml_sycl_xe1_stash_clear() {
     for (auto & e : g_stash) {
         e = {};

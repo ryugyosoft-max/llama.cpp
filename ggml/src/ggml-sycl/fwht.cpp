@@ -1,4 +1,6 @@
 #include "fwht.hpp"
+#include "llama-xe1.hpp"
+#include "fattn-xe1dec.hpp"
 
 #include <cmath>
 #define P 1.0f
@@ -421,6 +423,7 @@ bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src,
     if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
         return false;
     }
+    ggml_sycl_xe1_stash_drop_range(dst->data, ggml_nbytes(dst));  // [a770-opt] no q8 copy: an older one here is stale
 
     switch (src->type) {
         case GGML_TYPE_F32:
@@ -568,6 +571,109 @@ static void launch_fwht(const T * src, float * dst, const int64_t n_rows, const 
     }
 }
 
+// [a770-opt] 4096-point rows (every Bonsai / Qwen3.5-prism rotation; the FFN-down one is 3 such rows) for Arc
+// Alchemist decode. fwht_kernel_slm runs 12 barrier-separated SLM passes in one work-group per row - one row is a
+// single work-group on the whole GPU, so each rotation was ~10 us of serial latency, ~130 times per token. Here 256
+// work-items hold 16 values each (element k * 256 + t): the 4 butterfly stages over the register index run in
+// registers, the 4 over the lane index through sub-group shuffles, and one SLM transpose turns the sub-group index
+// into the register index for the last 4. With q8 set the kernel also writes the q8_1 SoA quantization of the
+// result (quantize_and_reorder_q8_1_soa layout and math over the rows taken as one column) for the PTQ1_0 mat-vecs.
+template <bool has_signs>
+static void fwht4096_kernel(const float * __restrict__ src, float * __restrict__ dst, const float scale,
+                            const float * __restrict__ signs, const int n_blk, int8_t * __restrict__ q8,
+                            const int ncols_q8, float * s, const sycl::nd_item<1> & item) {
+    constexpr int N = 4096, NT = 256, R = 16;
+    const auto    sg   = item.get_sub_group();
+    const int     r    = (int) item.get_group(0);
+    const int     t    = (int) item.get_local_id(0);
+    const int     lane = sg.get_local_linear_id();
+    src += (int64_t) r * N;
+    dst += (int64_t) r * N;
+    const float * signs_row = has_signs ? signs + (r % n_blk) * N : nullptr;
+
+    float v[R];
+#pragma unroll
+    for (int k = 0; k < R; ++k) {
+        const int i = k * NT + t;
+        v[k]        = src[i] * scale;
+        if constexpr (has_signs) {
+            v[k] *= signs_row[i];
+        }
+    }
+    auto reg_stages = [&]() {
+#pragma unroll
+        for (int h = 1; h < R; h *= 2) {
+#pragma unroll
+            for (int k = 0; k < R; ++k) {
+                if ((k & h) == 0) {
+                    const float x = v[k], y = v[k + h];
+                    v[k]     = x + y;
+                    v[k + h] = x - y;
+                }
+            }
+        }
+    };
+    reg_stages();  // index bits 8..11
+#pragma unroll
+    for (int h = 1; h < WARP_SIZE; h *= 2) {  // bits 0..3 (lane)
+#pragma unroll
+        for (int k = 0; k < R; ++k) {
+            const float o = dpct::permute_sub_group_by_xor(sg, v[k], h, WARP_SIZE);
+            v[k]          = (lane & h) == 0 ? v[k] + o : o - v[k];
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < R; ++k) {
+        s[k * NT + t] = v[k];
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    // work-item t = hi * 16 + lo now holds elements hi * 256 + k * 16 + lo: bits 4..7 are the register index
+    const int hi = t >> 4, lo = t & 15;
+#pragma unroll
+    for (int k = 0; k < R; ++k) {
+        v[k] = s[(hi << 8) | (k << 4) | lo];
+    }
+    reg_stages();
+#pragma unroll
+    for (int k = 0; k < R; ++k) {
+        dst[(hi << 8) | (k << 4) | lo] = v[k];
+    }
+    if (q8) {
+        // q8_1 block b = hi * 8 + m holds elements hi * 256 + 32 m + {lo, 16 + lo}: registers 2m, 2m + 1 of a sub-group
+        int8_t *      qr = q8 + (int64_t) r * N;
+        sycl::half2 * ds = (sycl::half2 *) (q8 + ncols_q8) + r * (N / QK8_1);
+#pragma unroll
+        for (int m = 0; m < R / 2; ++m) {
+            const float y0   = v[2 * m], y1 = v[2 * m + 1];
+            const float sum  = sycl::reduce_over_group(sg, y0 + y1, sycl::plus<float>());
+            const float amax = sycl::reduce_over_group(sg, sycl::fmax(sycl::fabs(y0), sycl::fabs(y1)), sycl::maximum<float>());
+            const float d    = amax == 0 ? 1.0f : amax / 127;
+            const int   i0   = (hi << 8) | (m << 5) | lo;
+            qr[i0]           = (int8_t) sycl::round(y0 / d);
+            qr[i0 + 16]      = (int8_t) sycl::round(y1 / d);
+            if (lane == 0) {
+                ds[hi * 8 + m] = sycl::half2(sycl::half(amax == 0 ? 0.0f : d), sycl::half(sum));
+            }
+        }
+    }
+}
+
+static void launch_fwht4096(const float * src, float * dst, const int64_t n_rows, const float scale,
+                            const float * signs, const int n_blk, int8_t * q8, dpct::queue_ptr stream) {
+    const int ncols_q8 = (int) n_rows * 4096;
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> s(sycl::range<1>(4096), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(n_rows * 256, 256), [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            float * sp = s.get_multi_ptr<sycl::access::decorated::no>().get();
+            if (signs) {
+                fwht4096_kernel<true>(src, dst, scale, signs, n_blk, q8, ncols_q8, sp, item);
+            } else {
+                fwht4096_kernel<false>(src, dst, scale, nullptr, 1, q8, ncols_q8, sp, item);
+            }
+        });
+    });
+}
+
 template <typename T>
 static bool fwht_dispatch(const T * src_d, float * dst_d, const int n, const int64_t rows, const float scale,
                           const float * signs, const int n_blk, dpct::queue_ptr stream) {
@@ -617,6 +723,21 @@ static bool fwht_run(ggml_backend_sycl_context & ctx, const ggml_tensor * src, g
     }
 
     const float scale = 1.0f / std::sqrt((float) n);
+    ggml_sycl_xe1_stash_drop_range(dst->data, ggml_nbytes(dst));  // a q8 copy of an older tensor here is stale now
+    // [a770-opt] decode-sized 4096-point rotations: register/sub-group kernel, plus the q8_1 copy for the mat-vecs
+    static const bool r4096 = ggml_sycl_knob("GGML_SYCL_FWHT4096", ggml_sycl_device_is_alchemist(ctx.device) ? 1 : 0) != 0;
+    if (r4096 && n == 4096 && src->type == GGML_TYPE_F32 && rows <= 8) {
+        static const bool q8_on = ggml_sycl_knob("GGML_SYCL_FWHT_Q8", 0) != 0;  // costs more than the quantize launch it saves
+        int8_t * q8 = nullptr;
+        if (q8_on && rows <= 3) {  // one column of up to 12288 (FFN down: 3 rows) -> one mat-vec input
+            q8 = (int8_t *) ggml_sycl_xe1_stash_slot(ctx.stream(), (size_t) rows * 4096 + rows * 128 * 4);
+        }
+        launch_fwht4096((const float *) src->data, (float *) dst->data, rows, scale, signs, n_blk, q8, ctx.stream());
+        if (q8) {
+            ggml_sycl_xe1_stash_put(dst->data, q8);
+        }
+        return true;
+    }
     if (src->type == GGML_TYPE_F32) {
         return fwht_dispatch((const float *) src->data, (float *) dst->data, n, rows, scale, signs, n_blk, ctx.stream());
     }

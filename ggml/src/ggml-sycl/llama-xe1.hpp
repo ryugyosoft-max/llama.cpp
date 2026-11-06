@@ -13,6 +13,8 @@ void * ggml_sycl_xe1_stash_slot(dpct::queue_ptr stream, size_t bytes);  // nullp
 void   ggml_sycl_xe1_stash_put(const void * f32, const void * q8);
 const void * ggml_sycl_xe1_stash_get(const void * f32);
 void   ggml_sycl_xe1_stash_clear();
+// forget entries whose f32 tensor starts inside [p, p + n): that memory is being rewritten by another op
+void   ggml_sycl_xe1_stash_drop_range(const void * p, size_t n);
 
 // [add +] rms_norm * w for one row of K floats (K % 32 == 0, K <= 16384): add_out (nullable) = a + b, normed = norm * w,
 // q8 = SoA quantization of normed. b may be null (no add).
