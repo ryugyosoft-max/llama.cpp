@@ -821,6 +821,26 @@ void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
     const size_t ts_mul = ggml_type_size(mul_src->type);
     GGML_ASSERT(mul_src->nb[0] == ts_mul);
+    {
+        // [a770-opt] rows of <= 1024 (attention q / k norms: 256 x heads) times one weight vector: one work-group per
+        // row, 32-bit offsets (the general kernel's 64-bit stride / broadcast math is emulated on Xe)
+        const int64_t nrows = ne01 * ne02 * ne03;
+        if (ne00 % 16 == 0 && ne00 <= 1024 && ne02 == 1 && ne03 == 1 && ggml_nrows(mul_src) == 1 &&
+            mul_src->ne[0] == ne00 && s01 * nrows < INT32_MAX && d01 * nrows < INT32_MAX &&
+            ggml_sycl_knob("GGML_SYCL_RMS_NORM_ROW", 1)) {
+            const int     n   = (int) ne00, ss = (int) s01, ds = (int) d01;
+            const float * x   = src0_dd;
+            const float * w   = mul_dd;
+            float *       out = dst_dd;
+            main_stream->parallel_for(sycl::nd_range<1>((size_t) nrows * n, (size_t) n), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                const int   r  = (int) it.get_group(0), j = (int) it.get_local_id(0);
+                const float v  = x[r * ss + j];
+                const float sq = sycl::reduce_over_group(it.get_group(), v * v, sycl::plus<float>());
+                out[r * ds + j] = v * sycl::rsqrt(sq / n + eps) * w[j];
+            });
+            return;
+        }
+    }
     const int64_t mul_s01 = mul_src->nb[1] / ts_mul;
     const int64_t mul_s02 = mul_src->nb[2] / ts_mul;
     const int64_t mul_s03 = mul_src->nb[3] / ts_mul;
