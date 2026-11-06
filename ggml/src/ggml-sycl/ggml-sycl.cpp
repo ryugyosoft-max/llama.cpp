@@ -3496,7 +3496,10 @@ inline void ggml_sycl_op_mul_mat_sycl(
             GGML_ASSERT(to_fp16_sycl != nullptr);
             size_t ne = row_diff*ne00;
             src0_as_f16.alloc(ne);
-            to_fp16_sycl(src0_dd_i, src0_as_f16.get(), ne, stream);
+            static const bool skip_cvt = getenv("GGML_SYCL_SKIP_SRC0_CVT") != nullptr;  // [a770-opt] timing only
+            if (!skip_cvt) {
+                to_fp16_sycl(src0_dd_i, src0_as_f16.get(), ne, stream);
+            }
         }
         const sycl::half *src0_ptr = src0->type == GGML_TYPE_F16
                                          ? (const sycl::half *)src0_dd_i

@@ -151,9 +151,78 @@ static void dequantize_row_q4_0_sycl(const void *vx, dst_t *y, const int64_t k,
     }
 }
 
+// [a770-opt] one work-item per 32-value block: one 16-byte qs load, four 16-byte stores (the per-byte kernel below did
+// 1-byte loads and 2-byte stores: Llama 2 7B prefill spent ~1 ms per 4096x14336 matrix converting it to f16)
+template <typename dst_t>
+static void dequantize_row_q4_0_sycl_reorder_blk(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
+    const int64_t nb = k / QK4_0;
+    const uint8_t *    qs = (const uint8_t *) vx;
+    const sycl::half * d  = (const sycl::half *) (qs + k / 2);
+    constexpr int WG = 256;
+    stream->parallel_for(sycl::nd_range<1>((size_t) ((nb + WG - 1) / WG) * WG, WG), [=](sycl::nd_item<1> it) {
+        const int64_t ib = it.get_global_id(0);
+        if (ib >= nb) {
+            return;
+        }
+        const sycl::uint4 q  = *(const sycl::uint4 *) (qs + ib * 16);
+        const float       dv = (float) d[ib];
+        const uint32_t    w[4] = { q.x(), q.y(), q.z(), q.w() };
+        sycl::vec<dst_t, 8> lo[2], hi[2];
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const uint32_t b = (w[j / 4] >> (8 * (j % 4))) & 0xFF;
+            lo[j / 8][j % 8] = (dst_t) (dv * ((int) (b & 0xF) - 8));
+            hi[j / 8][j % 8] = (dst_t) (dv * ((int) (b >> 4) - 8));
+        }
+        sycl::vec<dst_t, 8> * out = (sycl::vec<dst_t, 8> *) (y + ib * QK4_0);
+        out[0] = lo[0];
+        out[1] = lo[1];
+        out[2] = hi[0];
+        out[3] = hi[1];
+    });
+}
+
+// [a770-opt] standard layout (18-byte blocks: half d, 16 qs bytes): one work-item per block, 2-byte loads (blocks are
+// only 2-byte aligned), four 16-byte stores
+template <typename dst_t>
+static void dequantize_row_q4_0_sycl_blk(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
+    const int64_t nb = k / QK4_0;
+    constexpr int WG = 256;
+    stream->parallel_for(sycl::nd_range<1>((size_t) ((nb + WG - 1) / WG) * WG, WG), [=](sycl::nd_item<1> it) {
+        const int64_t ib = it.get_global_id(0);
+        if (ib >= nb) {
+            return;
+        }
+        const uint16_t * b  = (const uint16_t *) ((const uint8_t *) vx + ib * sizeof(block_q4_0));
+        const float      dv = (float) sycl::bit_cast<sycl::half>(b[0]);
+        sycl::vec<dst_t, 8> lo[2], hi[2];
+#pragma unroll
+        for (int h = 0; h < 8; ++h) {
+            const uint16_t w = b[1 + h];
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int      j  = 2 * h + e;
+                const uint32_t by = (w >> (8 * e)) & 0xFF;
+                lo[j / 8][j % 8] = (dst_t) (dv * ((int) (by & 0xF) - 8));
+                hi[j / 8][j % 8] = (dst_t) (dv * ((int) (by >> 4) - 8));
+            }
+        }
+        sycl::vec<dst_t, 8> * out = (sycl::vec<dst_t, 8> *) (y + ib * QK4_0);
+        out[0] = lo[0];
+        out[1] = lo[1];
+        out[2] = hi[0];
+        out[3] = hi[1];
+    });
+}
+
 template <typename dst_t>
 static void dequantize_row_q4_0_sycl_reorder(const void *vx, dst_t *y, const int64_t k,
                                      dpct::queue_ptr stream) {
+    static const bool blk = !getenv("GGML_SYCL_Q4_0_DEQ_BLK") || atoi(getenv("GGML_SYCL_Q4_0_DEQ_BLK")) != 0;
+    if (blk) {
+        dequantize_row_q4_0_sycl_reorder_blk(vx, y, k, stream);
+        return;
+    }
 
     dpct::has_capability_or_fail(stream->get_device(),
                                     {sycl::aspect::fp16});
@@ -735,6 +804,9 @@ static to_t_sycl_t<dst_t> ggml_get_dequant_sycl(ggml_type type, ggml_tensor * ds
             } else if constexpr (std::is_same_v<dst_t, float>) {
                 return dequantize_row_q4_0_sycl;
             } else {
+                if (!getenv("GGML_SYCL_Q4_0_DEQ_BLK") || atoi(getenv("GGML_SYCL_Q4_0_DEQ_BLK")) != 0) {
+                    return dequantize_row_q4_0_sycl_blk<dst_t>;
+                }
                 return dequantize_block_sycl<QK4_0, QR4_0, dequantize_q4_0, dst_t>;
             }
         case GGML_TYPE_Q4_1:
