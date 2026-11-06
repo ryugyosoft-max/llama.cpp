@@ -6013,6 +6013,236 @@ static int64_t mmvq_chunk_max() {
     return v;
 }
 
+#if GGML_SYCL_DNNL
+// [a770-opt] Large-batch (prompt) mat-muls on oneDNN's weight-decompression matmul instead of writing an f16 copy of
+// the weights and running the f16 GEMM (that copy was ~40% of a Llama 2 7B prompt batch; the u4 / s8 GEMM is also
+// faster than the f16 one).
+//   Q4_0: reads the MMVQ reorder layout in place (qs [N][K/2], d [N][K/32]) as u4: a reorder byte holds values j and
+//         j + 16 of its block where u4 expects 2i and 2i + 1, so the activations are permuted alike inside each
+//         block while they are converted to f16. Zero point 8 (per-group u8 array; a common zero point takes oneDNN's
+//         reference kernel). Dropping it for a correction GEMM over the per-32 activation sums cost 15%.
+//   Q4_K: per-call repack to natural-order u4 + scale d * sc per 32; the min term -dmin * m_j * sum_j(x) is folded
+//         into the same GEMM as a 9th group of 32 columns per 256-block (no integer zero point can express it).
+//   Q6_K: per-call repack to s8 (q - 32) + scale d * sc per 16.
+// GGML_SYCL_WD_DNNL=0 turns it off, GGML_SYCL_WD_DNNL_MIN = fewest tokens (default 32).
+static bool ggml_sycl_wd_dnnl(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                              ggml_tensor * dst) {
+    static const bool on  = ggml_sycl_knob("GGML_SYCL_WD_DNNL", 1) != 0;
+    static const int  min = getenv("GGML_SYCL_WD_DNNL_MIN") ? atoi(getenv("GGML_SYCL_WD_DNNL_MIN")) : 32;
+    const ggml_type   type = src0->type;
+    if (!on || !g_ggml_sycl_enable_dnn || (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q6_K) ||
+        dst->op != GGML_OP_MUL_MAT || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || src1->ne[1] < min ||
+        src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || !ggml_is_contiguous(src0) ||
+        src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) || dst->nb[1] % sizeof(float) != 0 ||
+        src0->ne[0] % ggml_blck_size(type) != 0 || src0->view_src != nullptr ||
+        ggml_backend_buffer_is_sycl_split(src0->buffer) || src0->buffer->usage == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        return false;
+    }
+    auto * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+    if (!extra) {
+        return false;
+    }
+    if (!extra->optimized_feature.reorder) {  // install the decode layout now (the next decode would do it anyway)
+        if (!g_ggml_sycl_enable_optimize || !ctx.opt_feature.reorder || !reorder_qw(src0, ctx.stream())) {
+            return false;
+        }
+        extra->optimized_feature.reorder = true;
+    }
+    const int64_t K = src0->ne[0], N = src0->ne[1], T = src1->ne[1], G = K / 32;
+    if (K > INT32_MAX || N > INT32_MAX || T > INT32_MAX || N * K > INT32_MAX * 2LL) {
+        return false;
+    }
+    const queue_ptr stream = ctx.stream();
+    const uint8_t * w0     = (const uint8_t *) src0->data;
+    const bool      perm   = type == GGML_TYPE_Q4_0;
+    // Q4_0 takes oneDNN's zero point 8 (in-model ~2% slower than none; a correction GEMM cost 15%). Q4_K's min term
+    // -dmin * m_j * sum(x over sub-block j) rides in the same GEMM: each 256-block gets a 9th group of 32 columns,
+    // weights m_j & 15 (8), m_j >> 4 (8), 0 (16), activations S_j, 16 S_j, 0, group scale -dmin (KA = 9/8 K)
+    const bool      aug    = type == GGML_TYPE_Q4_K;
+    const int64_t   KA     = aug ? K / QK_K * 288 : K;
+
+    // activations f32 [T][K] -> f16 [T][K] (Q4_0: value j + 16 h of a block to position 2 j + h) and the per-32 sums
+    ggml_sycl_pool_alloc<sycl::half> xh(ctx.pool(), (size_t) T * KA);
+    {
+        sycl::half *  xo  = xh.get();
+        const float * xi  = (const float *) src1->data;
+        const int64_t ld  = src1->nb[1] / sizeof(float);
+        stream->parallel_for(sycl::nd_range<1>((size_t) T * G * 16, 16), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const int64_t tg = it.get_group(0);
+            const int64_t t = tg / G, g = tg % G;
+            const int     j = it.get_local_id(0);
+            const float * x = xi + t * ld + g * 32;
+            const float   a = x[j], b = x[j + 16];
+            sycl::half *  o = xo + t * KA + (aug ? (g / 8) * 288 + (g % 8) * 32 : g * 32);
+            if (aug) {
+                const float s = sycl::reduce_over_group(it.get_sub_group(), a + b, sycl::plus<float>());
+                sycl::half * e = xo + t * KA + (g / 8) * 288 + 256;
+                if (j == 0) {
+                    e[g % 8]     = sycl::half(s);
+                    e[8 + g % 8] = sycl::half(16.0f * s);
+                }
+                if (g % 8 == 0) {
+                    e[16 + j] = sycl::half(0.0f);
+                }
+            }
+            if (perm) {
+                *(sycl::half2 *) (o + 2 * j) = sycl::half2(sycl::half(a), sycl::half(b));
+            } else {
+                o[j]      = sycl::half(a);
+                o[j + 16] = sycl::half(b);
+            }
+        });
+    }
+
+    // weights: Q4_0 in place; K-quants repacked per call. scales (and correction weights) as [G'][N]
+    const int  Gs = type == GGML_TYPE_Q6_K ? (int) (K / 16) : (int) (KA / 32);
+    ggml_sycl_pool_alloc<sycl::half> sc(ctx.pool(), (size_t) Gs * N);
+    ggml_sycl_pool_alloc<uint8_t>    wr(ctx.pool(), type == GGML_TYPE_Q4_0 ? 1 : (size_t) N * KA / (type == GGML_TYPE_Q6_K ? 1 : 2));
+    const void *   wmain = w0;
+    dnnl::memory::data_type wt = dnnl::memory::data_type::u4;
+    if (type == GGML_TYPE_Q4_0) {
+        const sycl::half * d  = (const sycl::half *) (w0 + (size_t) N * K / 2);
+        sycl::half *       so = sc.get();
+        stream->parallel_for(sycl::range<2>((size_t) G, (size_t) N), [=](sycl::id<2> id) {
+            so[id[0] * N + id[1]] = d[id[1] * G + id[0]];
+        });
+    } else if (type == GGML_TYPE_Q4_K) {
+        const int64_t       nb  = N * (K / QK_K);
+        const uint8_t *     qs  = w0;
+        const uint8_t *     scp = w0 + (size_t) nb * (QK_K / 2);
+        const sycl::half2 * dm  = (const sycl::half2 *) (scp + (size_t) nb * K_SCALE_SIZE);
+        uint8_t *           wo  = wr.get();
+        sycl::half *        so  = sc.get();
+        const int64_t       KB  = K / QK_K;
+        // one 16-lane sub-group per 256-block, rows n of a work-group adjacent (scale writes [G][N] closer together).
+        // lane L writes u4 bytes 8L..8L+7 = values 16L..16L+15 of chunk c = L / 4: from reorder bytes 32c + (16L % 32)
+        // .. + 15, low nibbles for the first 32 values of the chunk, high for the second
+        stream->parallel_for(sycl::nd_range<1>((size_t) (nb + 7) / 8 * 128, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const int64_t gid = it.get_global_id(0) / 16;
+            if (gid >= nb) {
+                return;
+            }
+            const int     L   = it.get_sub_group().get_local_linear_id();
+            const int64_t n = gid % N, kb = gid / N;
+            const int64_t ib = n * KB + kb;
+            const int     c  = L / 4, p = 16 * (L % 4);  // chunk, value offset in it
+            const sycl::uint4 v  = *(const sycl::uint4 *) (qs + ib * (QK_K / 2) + 32 * c + (p % 32));
+            const uint32_t    w4[4] = { v.x(), v.y(), v.z(), v.w() };
+            uint32_t          o2[2];
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                uint32_t r = 0;
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {  // output byte 4h + e = values 8h + 2e, 8h + 2e + 1 of this lane's 16
+                    const int      i0 = 8 * h + 2 * e;
+                    const uint32_t b0 = (w4[i0 / 4] >> (8 * (i0 % 4))) & 0xFF, b1 = (w4[(i0 + 1) / 4] >> (8 * ((i0 + 1) % 4))) & 0xFF;
+                    const uint32_t n0 = p < 32 ? (b0 & 0xF) : (b0 >> 4), n1 = p < 32 ? (b1 & 0xF) : (b1 >> 4);
+                    r |= (n0 | (n1 << 4)) << (8 * e);
+                }
+                o2[h] = r;
+            }
+            uint8_t * ob = wo + (n * KA + kb * 288) / 2;
+            *(sycl::uint2 *) (ob + 8 * L) = sycl::uint2(o2[0], o2[1]);
+            if (L == 0) {  // the 8 scales, the extra group's weights (m_j low / high nibble) and its scale -dmin
+                const uint8_t * s = scp + ib * K_SCALE_SIZE;
+                const float     d = (float) dm[ib].x(), dmin = (float) dm[ib].y();
+                uint8_t         mv[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    uint8_t scv;
+                    if (j < 4) {
+                        scv   = s[j] & 63;
+                        mv[j] = s[j + 4] & 63;
+                    } else {
+                        scv   = (s[j + 4] & 0xF) | ((s[j - 4] >> 6) << 4);
+                        mv[j] = (s[j + 4] >> 4) | ((s[j] >> 6) << 4);
+                    }
+                    so[(kb * 9 + j) * N + n] = sycl::half(d * scv);
+                }
+                so[(kb * 9 + 8) * N + n] = sycl::half(-dmin);
+                uint32_t e[4] = { 0, 0, 0, 0 };
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    e[0] |= (uint32_t) ((mv[2 * i] & 15) | ((mv[2 * i + 1] & 15) << 4)) << (8 * i);
+                    e[1] |= (uint32_t) ((mv[2 * i] >> 4) | ((mv[2 * i + 1] >> 4) << 4)) << (8 * i);
+                }
+                *(sycl::uint4 *) (ob + 128) = sycl::uint4(e[0], e[1], e[2], e[3]);
+            }
+        });
+        wmain = wr.get();
+    } else {  // Q6_K
+        const int64_t      nb  = N * (K / QK_K);
+        const uint8_t *    ql  = w0;
+        const uint8_t *    qh  = ql + (size_t) nb * (QK_K / 2);
+        const int8_t *     scp = (const int8_t *) (qh + (size_t) nb * (QK_K / 4));
+        const sycl::half * dd  = (const sycl::half *) ((const uint8_t *) scp + (size_t) nb * (QK_K / 16));
+        int8_t *           wo  = (int8_t *) wr.get();
+        sycl::half *       so  = sc.get();
+        const int64_t      KB  = K / QK_K;
+        // one 16-lane sub-group per 256-block; lane L writes values 16L..16L+15 = half h, quarter q, l0..l0+15 of
+        // dequantize_row_q6_K's (128h + 32q + l) order, from 16 ql and 16 qh bytes
+        stream->parallel_for(sycl::nd_range<1>((size_t) (nb + 7) / 8 * 128, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const int64_t gid = it.get_global_id(0) / 16;
+            if (gid >= nb) {
+                return;
+            }
+            const int     L   = it.get_sub_group().get_local_linear_id();
+            const int64_t n = gid % N, kb = gid / N;
+            const int64_t ib = n * KB + kb;
+            const int h = L / 8, q = (L % 8) / 2, l0 = 16 * (L % 2);
+            const sycl::uint4 lv = *(const sycl::uint4 *) (ql + ib * (QK_K / 2) + 64 * h + (q & 1) * 32 + l0);
+            const sycl::uint4 hv = *(const sycl::uint4 *) (qh + ib * (QK_K / 4) + 32 * h + l0);
+            const uint32_t lw[4] = { lv.x(), lv.y(), lv.z(), lv.w() }, hw[4] = { hv.x(), hv.y(), hv.z(), hv.w() };
+            uint32_t o4[4];
+#pragma unroll
+            for (int d = 0; d < 4; ++d) {
+                uint32_t r = 0;
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const uint32_t lb = (lw[d] >> (8 * e)) & 0xFF, hb = (hw[d] >> (8 * e)) & 0xFF;
+                    const uint32_t lo = q < 2 ? (lb & 0xF) : (lb >> 4);
+                    const int      v  = (int) (lo | (((hb >> (2 * q)) & 3) << 4)) - 32;
+                    r |= ((uint32_t) (uint8_t) (int8_t) v) << (8 * e);
+                }
+                o4[d] = r;
+            }
+            *(sycl::uint4 *) (wo + n * K + kb * QK_K + 16 * L) = sycl::uint4(o4[0], o4[1], o4[2], o4[3]);
+            so[(kb * 16 + L) * N + n] = sycl::half((float) dd[ib] * scp[ib * 16 + L]);
+        });
+        wmain = wr.get();
+        wt    = dnnl::memory::data_type::s8;
+    }
+
+    float *   dd  = (float *) dst->data;
+    const int ldc = (int) (dst->nb[1] / sizeof(float));
+    const int gsize = type == GGML_TYPE_Q6_K ? 16 : 32;  // values per scale
+    const uint8_t * zp = nullptr;
+    if (type == GGML_TYPE_Q4_0) {  // one persistent u8 array of 8s per device, grown to the largest G * N seen
+        static std::map<int, std::pair<uint8_t *, size_t>> zps;
+        auto & z = zps[ctx.device];
+        if (z.second < (size_t) (G * N)) {
+            if (z.first) {
+                SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+                sycl::free(z.first, *stream);
+            }
+            z.second = (size_t) (G * N);
+            z.first  = sycl::malloc_device<uint8_t>(z.second, *stream);
+            if (!z.first) {
+                z.second = 0;
+                return false;
+            }
+            stream->memset(z.first, 8, z.second);
+        }
+        zp = z.first;
+    }
+    if (!DnnlGemmWrapper::gemm_wd_group(ctx, (int) N, (int) T, (int) KA, xh.get(), wt, wmain, gsize, sc.get(), dd, ldc, false,
+                                        stream, false, zp)) {
+        return false;  // dst untouched: the caller takes the regular path
+    }
+    return true;
+}
+#endif
+
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
 
@@ -6035,6 +6265,11 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         ggml_sycl_pq2_xmx_mul_mat(ctx, src0, src1, dst);
         return;
     }
+#if GGML_SYCL_DNNL
+    if (ggml_sycl_wd_dnnl(ctx, src0, src1, dst)) {
+        return;
+    }
+#endif
 
     const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
     int64_t min_compute_capability = INT_MAX;

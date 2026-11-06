@@ -114,6 +114,65 @@ public:
         prim.execute(stream, args);
     }
 
+    // [a770-opt] weight-decompression GEMM: dst[t * ldc + r] (+)= sum_c act[t * k + c] * scale[c / G][r] * w[r][c], G = values
+    // per scale (0: no scales)
+    // w u4 (unsigned, no zero point: oneDNN's grouped zero points cost 2-3x on the A770) or s8, row r contiguous along k
+    // (u4: element c in the low nibble when c is even), scale f16 dense [k / G][m]. accumulate: add to dst (sum post-op).
+    // returns false (nothing launched) when oneDNN has no implementation for the configuration
+    static bool gemm_wd_group(ggml_backend_sycl_context & ctx, int m, int n, int k, const sycl::half * act, dt wt,
+                              const void * w, int G, const sycl::half * scales, float * dst, int ldc, bool accumulate,
+                              const queue_ptr & q, bool w_kn = false, const uint8_t * zp = nullptr) {
+        // w_kn: w stored [k][m]; zp: u8 zero points dense [k / G][m] (nullptr: none)
+        auto stream = ctx.stream_dnnl(q);
+        auto eng    = ctx.engine_dnnl(q);
+
+        const auto act_md = dnnl::memory::desc({ n, k }, dt::f16, tag::ab);
+        const auto w_md   = dnnl::memory::desc({ k, m }, wt, w_kn ? tag::ab : tag::ba);
+        const auto dst_md = dnnl::memory::desc({ n, m }, dt::f32, dnnl::memory::dims{ ldc, 1 });
+        const auto sc_md  = dnnl::memory::desc({ G > 0 ? k / G : 1, m }, dt::f16, tag::ab);
+
+        dnnl::primitive_attr attr;
+        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+        if (G > 0) {
+            attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1), { G, 1 }, dt::f16);
+        }
+        if (zp) {
+            attr.set_zero_points(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1), { G, 1 }, dt::u8);
+        }
+        attr.set_fpmath_mode(dnnl::fpmath_mode::f16, true);
+        if (accumulate) {
+            dnnl::post_ops po;
+            po.append_sum(1.0f);
+            attr.set_post_ops(po);
+        }
+
+        dnnl::matmul::primitive_desc pd;
+        try {
+            pd = dnnl::matmul::primitive_desc(eng, act_md, w_md, dst_md, attr);
+        } catch (const dnnl::error &) {
+            return false;
+        }
+        auto prim = dnnl::matmul(pd);
+
+        std::unordered_map<int, dnnl::memory> args;
+        args.insert({ DNNL_ARG_SRC, dnnl::memory(act_md, eng, const_cast<sycl::half *>(act)) });
+        args.insert({ DNNL_ARG_WEIGHTS, dnnl::memory(w_md, eng, const_cast<void *>(w)) });
+        args.insert({ DNNL_ARG_DST, dnnl::memory(dst_md, eng, dst) });
+        if (G > 0) {
+            args.insert({ DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, dnnl::memory(sc_md, eng, const_cast<sycl::half *>(scales)) });
+        }
+        if (zp) {
+            const auto zp_md = dnnl::memory::desc({ k / G, m }, dt::u8, tag::ab);
+            args.insert({ DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_WEIGHTS, dnnl::memory(zp_md, eng, const_cast<uint8_t *>(zp)) });
+        }
+        const auto scratchpad_md = pd.scratchpad_desc();
+        ggml_sycl_pool_alloc<uint8_t> scratchpad(ctx.pool());
+        void * scratchpad_ptr = scratchpad_md.get_size() > 0 ? scratchpad.alloc(scratchpad_md.get_size()) : nullptr;
+        args.insert({ DNNL_ARG_SCRATCHPAD, dnnl::memory(scratchpad_md, eng, scratchpad_ptr) });
+        prim.execute(stream, args);
+        return true;
+    }
+
     // dst[t * m + r] = sum_k act[t * k + c] * w[r][c], all int8, int32 accumulate, f32 out (no scales)
     static void gemm_s8(ggml_backend_sycl_context & ctx, int m, int n, int k, const int8_t * act, const int8_t * w,
                         float * dst, const queue_ptr & q) {
