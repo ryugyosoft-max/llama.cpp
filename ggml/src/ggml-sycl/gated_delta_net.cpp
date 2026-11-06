@@ -1,5 +1,6 @@
 #include <unordered_map>
 #include <sycl/sycl.hpp>
+#include <sycl/ext/intel/esimd.hpp>
 #include "dpct/helper.hpp"
 #include "common.hpp"
 #include "ggml.h"
@@ -689,6 +690,360 @@ static void gdn_chunked_sycl(const float * q, const float * k, const float * v, 
 #undef GDN_CH_CALL
 }
 
+
+// [a770-opt] Chunked prefill in three kernels (S_k = S_v = 128, one sequence). Same per-chunk algebra as
+// gdn_chunked_sycl, split so that everything independent of the state runs for all chunks in parallel:
+//   dots (per (head, chunk)):  G = cumsum(g),  A = (beta_t e^{G_t-G_s} k_t.k_s)_{s<t},  M = (e^{G_t-G_s} q_t.k_s)_{s<=t},
+//                              e^G and e^{G_last-G}
+//   wu   (per (head, chunk)):  T = (I + A)^-1,  W = T diag(beta e^G) K,  U = T diag(beta) V
+//   scan (per (head, 16 value columns), chunks in order):
+//        Delta = U - W S,   O = scale (e^G (Q S) + M Delta),   S <- e^{G_last} S + (e^{G_last-G} K)^T Delta
+// Alchemist notes. dots / wu are SIMT: one operand of every product is one value per lane, broadcast with a
+// constant-index select_from_group (IGC emits a scalar register region in the mad, no shuffle), and loop trip counts
+// are compile-time so the loads of a step are in flight together. The scan is ESIMD: in SIMT form IGC hoisted every
+// load of the unrolled chunk body and spilled 2-9 KB per thread (DG2 has 128 GRF; a SIMD16 float costs 2), which
+// made it slower than the token-serial kernel. Measured limits: L2-resident row loads reach ~0.8 TB/s, so the scan's
+// floor is its W / Q / K / M traffic, and a work-group barrier costs ~0.5 us. A770, Qwen3.5 9B (32 heads), 512
+// tokens per layer: token-blocked kernel ~730 us, this ~550 us (dots 130, wu 110, scan 315); pp512 2381 -> 2472.
+// The serial chain is n_tokens / 32 steps. fp32 throughout.
+namespace {
+constexpr int GDN_CK_C = 32;   // tokens per chunk
+constexpr int GDN_CK_S = 128;  // head size
+}
+
+static void gdn_ck_dots(const float * q, const float * k, const float * g, const float * beta, float * Ad, float * Md,
+                        float * Xd, int64_t H, int64_t n_proc, int64_t nch, int64_t sq1, int64_t sq2, int64_t sb1,
+                        int64_t sb2, int64_t neqk1, dpct::queue_ptr stream) {
+    constexpr int C = GDN_CK_C, S = GDN_CK_S, L = 16, NSG = 8, WG = NSG * L, TG = 4;
+    // 16 tasks per (head, chunk): 8 groups of 4 query/key rows t x 2 blocks of 16 key rows s (lane = s)
+    stream->parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (H * nch * WG)), sycl::range<1>(WG)),
+        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const auto    sg   = it.get_sub_group();
+            const int     lane = sg.get_local_linear_id();
+            const int     w    = sg.get_group_linear_id();
+            const int64_t grp  = it.get_group(0);
+            const int64_t h    = grp / nch, ch = grp % nch;
+            const int64_t t0   = ch * C;
+            const int     nc   = (int) sycl::min((int64_t) C, n_proc - t0);
+            const int64_t hk   = h % neqk1;
+
+            // padded tokens: g = 0 keeps G at the last real value, beta = 0 zeroes their rows
+            const float g_lo = lane < nc ? g[(t0 + lane) * sb2 + h * sb1] : 0.0f;
+            const float g_hi = L + lane < nc ? g[(t0 + L + lane) * sb2 + h * sb1] : 0.0f;
+            const float b_lo = lane < nc ? beta[(t0 + lane) * sb2 + h * sb1] : 0.0f;
+            const float b_hi = L + lane < nc ? beta[(t0 + L + lane) * sb2 + h * sb1] : 0.0f;
+            const float G_lo = sycl::inclusive_scan_over_group(sg, g_lo, sycl::plus<float>());
+            const float G_hi = sycl::inclusive_scan_over_group(sg, g_hi, sycl::plus<float>()) +
+                               sycl::select_from_group(sg, G_lo, L - 1);
+            if (w == 0) {
+                const float Gl = sycl::select_from_group(sg, G_hi, L - 1);
+                float *     X  = Xd + grp * 2 * C;
+                X[lane]         = sycl::exp(G_lo);
+                X[L + lane]     = sycl::exp(G_hi);
+                X[C + lane]     = sycl::exp(Gl - G_lo);
+                X[C + L + lane] = sycl::exp(Gl - G_hi);
+            }
+
+#pragma unroll 1
+            for (int task = w; task < 2 * NSG; task += NSG) {
+                const int tg = task / 2, bb = task % 2;
+                const int s  = bb * L + lane;
+                float *   Ao = Ad + grp * C * C;
+                float *   Mo = Md + grp * C * C;
+                if (bb * L > tg * TG + TG - 1) {  // every s > t: zero block
+#pragma unroll
+                    for (int jj = 0; jj < TG; ++jj) {
+                        Ao[(tg * TG + jj) * C + s] = 0.0f;
+                        Mo[(tg * TG + jj) * C + s] = 0.0f;
+                    }
+                    continue;
+                }
+                const float * ks_row = k + (t0 + s) * sq2 + hk * sq1;
+                const bool    s_ok   = s < nc;
+                float         ak[TG], aq[TG];
+#pragma unroll
+                for (int jj = 0; jj < TG; ++jj) {
+                    ak[jj] = 0.0f;
+                    aq[jj] = 0.0f;
+                }
+#pragma unroll 2
+                for (int m = 0; m < S / L; ++m) {
+                    float kt[TG], qt[TG];
+#pragma unroll
+                    for (int jj = 0; jj < TG; ++jj) {
+                        const int     t   = tg * TG + jj;
+                        const int64_t off = (t0 + t) * sq2 + hk * sq1 + m * L + lane;
+                        kt[jj] = t < nc ? k[off] : 0.0f;
+                        qt[jj] = t < nc ? q[off] : 0.0f;
+                    }
+                    sycl::vec<float, 4> kv4[4];
+#pragma unroll
+                    for (int u = 0; u < 4; ++u) {
+                        kv4[u] = s_ok ? *(const sycl::vec<float, 4> *) (ks_row + m * L + 4 * u) : sycl::vec<float, 4>(0.0f);
+                    }
+#pragma unroll
+                    for (int r = 0; r < L; ++r) {
+                        const float kv = kv4[r / 4][r % 4];
+#pragma unroll
+                        for (int jj = 0; jj < TG; ++jj) {
+                            ak[jj] += sycl::select_from_group(sg, kt[jj], r) * kv;
+                            aq[jj] += sycl::select_from_group(sg, qt[jj], r) * kv;
+                        }
+                    }
+                }
+                const float Gs = bb ? G_hi : G_lo;
+#pragma unroll
+                for (int jj = 0; jj < TG; ++jj) {
+                    const int   t   = tg * TG + jj;  // uniform
+                    const float Gt  = sycl::group_broadcast(sg, t < L ? G_lo : G_hi, t % L);
+                    const float bt  = sycl::group_broadcast(sg, t < L ? b_lo : b_hi, t % L);
+                    const float dec = s <= t ? sycl::exp(Gt - Gs) : 0.0f;
+                    Ao[t * C + s]   = s < t ? bt * dec * ak[jj] : 0.0f;
+                    Mo[t * C + s]   = dec * aq[jj];
+                }
+            }
+        });
+}
+
+static void gdn_ck_wu(const float * k, const float * v, const float * beta, const float * Ad, const float * Xd,
+                      float * Wd, float * Ud, int64_t H, int64_t n_proc, int64_t nch, int64_t sq1, int64_t sq2,
+                      int64_t sv1, int64_t sv2, int64_t sb1, int64_t sb2, int64_t neqk1, dpct::queue_ptr stream) {
+    constexpr int C = GDN_CK_C, S = GDN_CK_S, L = 16, WG = 2 * S, CP = C + 1;
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> sA(sycl::range<1>(C * CP), cgh);
+        sycl::local_accessor<float, 1> sT(sycl::range<1>(C * CP), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (H * nch * WG)), sycl::range<1>(WG)),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                const auto    sg   = it.get_sub_group();
+                const int     tid  = it.get_local_id(0);
+                const int     lane = tid % L;
+                const int64_t grp  = it.get_group(0);
+                const int64_t h    = grp / nch, ch = grp % nch;
+                const int64_t t0   = ch * C;
+                const int     nc   = (int) sycl::min((int64_t) C, n_proc - t0);
+                const int64_t hk   = h % neqk1;
+#pragma unroll
+                for (int jj = 0; jj < C * C / WG; ++jj) {
+                    const int e = tid + jj * WG;
+                    sA[(e / C) * CP + e % C] = Ad[grp * C * C + e];
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+
+                // T = (I + A)^-1 (unit lower triangular): work-items 0..31 own one column each, right-looking
+                // substitution; column s of A is held two rows per lane and broadcast
+                if (tid < C) {
+                    float x[C];
+#pragma unroll
+                    for (int t = 0; t < C; ++t) {
+                        x[t] = t == tid ? 1.0f : 0.0f;
+                    }
+#pragma unroll
+                    for (int s = 0; s < C - 1; ++s) {
+                        const float a_lo = sA[lane * CP + s], a_hi = sA[(L + lane) * CP + s];
+#pragma unroll
+                        for (int t = s + 1; t < C; ++t) {
+                            x[t] -= sycl::select_from_group(sg, t < L ? a_lo : a_hi, t % L) * x[s];
+                        }
+                    }
+#pragma unroll
+                    for (int t = 0; t < C; ++t) {
+                        sT[t * CP + tid] = x[t];
+                    }
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+
+                // W = T diag(beta e^G) K (work-items 0..127, column j) and U = T diag(beta) V (128..255)
+                const int     j   = tid % S;
+                const bool    isw = tid < S;
+                const float * eG  = Xd + grp * 2 * C;
+                float         b[C];
+#pragma unroll
+                for (int t = 0; t < C; ++t) {
+                    const float bt = t < nc ? beta[(t0 + t) * sb2 + h * sb1] : 0.0f;
+                    const float x  = t < nc ? (isw ? eG[t] * k[(t0 + t) * sq2 + hk * sq1 + j]
+                                                   : v[(t0 + t) * sv2 + h * sv1 + j]) : 0.0f;
+                    b[t] = bt * x;
+                }
+                float * out = (isw ? Wd : Ud) + grp * C * S;
+#pragma unroll 2
+                for (int t = 0; t < C; ++t) {
+                    const float tr_lo = sT[t * CP + lane], tr_hi = sT[t * CP + L + lane];
+                    float       a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+                    for (int s = 0; s < L; ++s) {
+                        a0 += sycl::select_from_group(sg, tr_lo, s) * b[s];
+                        a1 += sycl::select_from_group(sg, tr_hi, s) * b[L + s];
+                    }
+                    out[t * S + j] = a0 + a1;
+                }
+            });
+    });
+}
+
+// scan (ESIMD): one work-group = 16 threads = one head x CW value columns; thread w owns state rows 8w..8w+7 (all CW
+// columns) as explicit registers and computes tokens w and w + 16 of every chunk. Every product is a scalar x row
+// mad: the row-indexed operand (W, Q, M, K) is a register element, the other operand a CW-wide row from SLM. In SIMT
+// form IGC hoisted every load of the unrolled chunk body and spilled 2-9 KB per thread; here registers and load
+// placement are explicit. SLM (CW * 512 B) holds the state copy for the products and then Delta.
+namespace gdn_ck_esimd {
+namespace esimd = sycl::ext::intel::esimd;
+
+template <int CW>
+ESIMD_INLINE void scan_thread(const float * q, const float * k, const float * Wd, const float * Ud, const float * Md,
+                              const float * Xd, const float * s_in, float * dst, float * s_out, int H, int n_proc,
+                              int nch, int sq1, int sq2, int neqk1, float scale, const int32_t * s_ids,
+                              int64_t s_row_stride, int grp, int w) {
+    using namespace esimd;
+    constexpr int C = GDN_CK_C, S = GDN_CK_S, NT = 16, RPT = S / NT, HS = S / 2;
+    slm_init<S * CW * sizeof(float)>();
+    const int h    = grp / (S / CW);
+    const int col0 = (grp % (S / CW)) * CW;
+    const int row0 = w * RPT;
+    const int hk   = h % neqk1;
+
+    const float * sin = s_in + (s_ids ? (int64_t) s_ids[0] * s_row_stride : (int64_t) 0) + (int64_t) h * S * S;
+    simd<float, RPT * CW> s;  // [r][c]
+    {
+        // state is column-major (element (i, c) at c * S + i): gather the 8 rows of every column
+        simd<uint32_t, CW> off(0, S * sizeof(float));
+#pragma unroll
+        for (int r = 0; r < RPT; ++r) {
+            s.template select<CW, 1>(r * CW) = gather<float, CW>(sin + (int64_t) col0 * S + row0 + r, off);
+        }
+    }
+
+    for (int ch = 0; ch < nch; ++ch) {
+        const int     t0  = ch * C;
+        const int     nc  = n_proc - t0 < C ? n_proc - t0 : C;
+        const int64_t cb  = (int64_t) h * nch + ch;
+        const float * Wc  = Wd + cb * C * S;
+        const float * Uc  = Ud + cb * C * S;
+        const float * Mc  = Md + cb * C * C;
+        const float * eG  = Xd + cb * 2 * C;
+        const float * qb  = q + (int64_t) t0 * sq2 + (int64_t) hk * sq1;
+        const float * kb  = k + (int64_t) t0 * sq2 + (int64_t) hk * sq1;
+        const int     ta  = w, tb = w + NT;  // this thread's tokens
+
+#pragma unroll
+        for (int r = 0; r < RPT; ++r) {
+            slm_block_store<float, CW>((row0 + r) * CW * sizeof(float), s.template select<CW, 1>(r * CW));
+        }
+        // first half rows of W / Q for both tokens (pad tokens: W rows are 0, Q not loaded)
+        simd<float, HS> wa = block_load<float, HS>(Wc + ta * S), wb = block_load<float, HS>(Wc + tb * S);
+        simd<float, HS> qa = 0.0f, qbv = 0.0f;
+        if (ta < nc) qa = block_load<float, HS>(qb + (int64_t) ta * sq2);
+        if (tb < nc) qbv = block_load<float, HS>(qb + (int64_t) tb * sq2);
+        barrier();
+
+        simd<float, CW> aw0 = 0.0f, aw1 = 0.0f, aq0 = 0.0f, aq1 = 0.0f;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            if (half == 1) {
+                wa = block_load<float, HS>(Wc + ta * S + HS);
+                wb = block_load<float, HS>(Wc + tb * S + HS);
+                if (ta < nc) qa = block_load<float, HS>(qb + (int64_t) ta * sq2 + HS);
+                if (tb < nc) qbv = block_load<float, HS>(qb + (int64_t) tb * sq2 + HS);
+            }
+#pragma unroll 8
+            for (int i = 0; i < HS; ++i) {
+                const simd<float, CW> sr = slm_block_load<float, CW>((half * HS + i) * CW * sizeof(float));
+                aw0 += sr * (float) wa[i];
+                aw1 += sr * (float) wb[i];
+                aq0 += sr * (float) qa[i];
+                aq1 += sr * (float) qbv[i];
+            }
+        }
+        const simd<float, CW> ua = block_load<float, CW>(Uc + ta * S + col0);
+        const simd<float, CW> ub = block_load<float, CW>(Uc + tb * S + col0);
+        const simd<float, C>  egv = block_load<float, C>(eG);
+        const simd<float, C>  dec = block_load<float, C>(eG + C);
+        const simd<float, C>  ma  = block_load<float, C>(Mc + ta * C);
+        const simd<float, C>  mb  = block_load<float, C>(Mc + tb * C);
+        barrier();  // the state copy is no longer read: Delta goes over it
+
+        slm_block_store<float, CW>(ta * CW * sizeof(float), ua - aw0);
+        slm_block_store<float, CW>(tb * CW * sizeof(float), ub - aw1);
+        // K rows row0..row0+7 of every token of the chunk, for the update (issued here: the W / Q rows are dead)
+        simd<float, C * RPT> kr = 0.0f;
+#pragma unroll
+        for (int t = 0; t < C; ++t) {
+            if (t < nc) kr.template select<RPT, 1>(t * RPT) = block_load<float, RPT>(kb + (int64_t) t * sq2 + row0);
+        }
+        barrier();
+
+        simd<float, CW> oa = aq0 * (float) egv[ta], ob = aq1 * (float) egv[tb];
+#pragma unroll 8
+        for (int s2 = 0; s2 < C; ++s2) {
+            const simd<float, CW> d = slm_block_load<float, CW>(s2 * CW * sizeof(float));
+            oa += d * (float) ma[s2];  // M is zero above the diagonal
+            ob += d * (float) mb[s2];
+        }
+        if (ta < nc) block_store<float, CW>(dst + ((int64_t) (t0 + ta) * H + h) * S + col0, oa * scale);
+        if (tb < nc) block_store<float, CW>(dst + ((int64_t) (t0 + tb) * H + h) * S + col0, ob * scale);
+
+        // S <- e^{G_last} S + K^T (e^{G_last - G} Delta) on this thread's rows
+        s *= (float) egv[C - 1];
+#pragma unroll 4
+        for (int t = 0; t < C; ++t) {
+            const simd<float, CW> d = slm_block_load<float, CW>(t * CW * sizeof(float)) * (float) dec[t];
+#pragma unroll
+            for (int r = 0; r < RPT; ++r) {
+                s.template select<CW, 1>(r * CW) += d * (float) kr[t * RPT + r];
+            }
+        }
+        barrier();  // Delta read by everyone; the next chunk rewrites the buffer
+    }
+
+    float * so = s_out + (int64_t) h * S * S;
+    simd<uint32_t, CW> off(0, S * sizeof(float));
+#pragma unroll
+    for (int r = 0; r < RPT; ++r) {
+        scatter<float, CW>(so + (int64_t) col0 * S + row0 + r, off, s.template select<CW, 1>(r * CW));
+    }
+}
+}  // namespace gdn_ck_esimd
+
+template <int CW>
+static void gdn_ck_scan_esimd(const float * q, const float * k, const float * Wd, const float * Ud, const float * Md,
+                              const float * Xd, const float * s_in, float * dst, float * s_out, int64_t H,
+                              int64_t n_proc, int64_t nch, int64_t sq1, int64_t sq2, int64_t neqk1, float scale,
+                              const int32_t * s_ids, int64_t s_row_stride, dpct::queue_ptr stream) {
+    constexpr int NT = 16;
+    const int     nwg = (int) H * (GDN_CK_S / CW);
+    stream->parallel_for(sycl::nd_range<1>((size_t) nwg * NT, NT), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+        gdn_ck_esimd::scan_thread<CW>(q, k, Wd, Ud, Md, Xd, s_in, dst, s_out, (int) H, (int) n_proc, (int) nch,
+                                      (int) sq1, (int) sq2, (int) neqk1, scale, s_ids, s_row_stride,
+                                      (int) it.get_group(0), (int) it.get_local_id(0));
+    });
+}
+
+static void gdn_ck_sycl(ggml_backend_sycl_context & ctx, const float * q, const float * k, const float * v,
+                        const float * g, const float * beta, const float * s_in, float * dst, float * s_out,
+                        int64_t H, int64_t n_proc, int64_t sq1, int64_t sq2, int64_t sv1, int64_t sv2, int64_t sb1,
+                        int64_t sb2, int64_t neqk1, float scale, const int32_t * s_ids, int64_t s_row_stride,
+                        dpct::queue_ptr stream) {
+    constexpr int C = GDN_CK_C, S = GDN_CK_S;
+    const int64_t nch = (n_proc + C - 1) / C;
+    ggml_sycl_pool_alloc<float> W(ctx.pool(), (size_t) (H * nch * C * S));
+    ggml_sycl_pool_alloc<float> U(ctx.pool(), (size_t) (H * nch * C * S));
+    ggml_sycl_pool_alloc<float> A(ctx.pool(), (size_t) (H * nch * C * C));
+    ggml_sycl_pool_alloc<float> M(ctx.pool(), (size_t) (H * nch * C * C));
+    ggml_sycl_pool_alloc<float> X(ctx.pool(), (size_t) (H * nch * 2 * C));
+    gdn_ck_dots(q, k, g, beta, A.get(), M.get(), X.get(), H, n_proc, nch, sq1, sq2, sb1, sb2, neqk1, stream);
+    gdn_ck_wu(k, v, beta, A.get(), X.get(), W.get(), U.get(), H, n_proc, nch, sq1, sq2, sv1, sv2, sb1, sb2, neqk1,
+              stream);
+    // 16 value columns per work-group: 4096 threads, single wave; 32 measured the same (half the threads, half the
+    // L2 traffic) - GGML_SYCL_GDN_CK_SCAN=32 selects it
+    static const int scan_cw = getenv("GGML_SYCL_GDN_CK_SCAN") ? atoi(getenv("GGML_SYCL_GDN_CK_SCAN")) : 16;
+    if (scan_cw == 32) {
+        gdn_ck_scan_esimd<32>(q, k, W.get(), U.get(), M.get(), X.get(), s_in, dst, s_out, H, n_proc, nch, sq1, sq2,
+                              neqk1, scale, s_ids, s_row_stride, stream);
+    } else {
+        gdn_ck_scan_esimd<16>(q, k, W.get(), U.get(), M.get(), X.get(), s_in, dst, s_out, H, n_proc, nch, sq1, sq2,
+                              neqk1, scale, s_ids, s_row_stride, stream);
+    }
+}
+
 // GET_ROWS (recurrent-state gather) -> GATED_DELTA_NET src[5] registrations, per context, reset per graph:
 // the gather is skipped and the kernel indexes the cache rows directly (port of the CUDA #220 fusion).
 struct ggml_sycl_gdn_gather {
@@ -809,6 +1164,27 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
         static const bool chunk_off = getenv("GGML_SYCL_GDN_CHUNKED") == nullptr;
         const int64_t n_tail = keep_rs ? (int64_t) K : 0;
         const int64_t n_proc = n_tokens - n_tail;
+        // [a770-opt] two-pass chunked prefill (gdn_ck_sycl), default on; GGML_SYCL_GDN_CK=0 restores the
+        // token-blocked kernel, GGML_SYCL_GDN_CK_MIN sets the minimum chunked token count
+        static const bool    ck_on  = !getenv("GGML_SYCL_GDN_CK") || atoi(getenv("GGML_SYCL_GDN_CK")) != 0;
+        static const int64_t ck_min = getenv("GGML_SYCL_GDN_CK_MIN") ? atoll(getenv("GGML_SYCL_GDN_CK_MIN")) : 64;
+        const bool ck_vec4 = sq1 % 4 == 0 && sq2 % 4 == 0 && ((uintptr_t) k_d % 16) == 0;  // vec4 key-row loads
+        if (ck_on && chunk_off && ck_vec4 && S_v == GDN_CK_S && n_seqs == 1 && neq3 == 1 && n_proc >= ck_min) {
+            float * so = state_d;
+            ggml_sycl_pool_alloc<float> mid(ctx.pool());
+            if (n_tail != 0) {
+                so = mid.alloc((size_t) H * S_v * S_v);
+            }
+            gdn_ck_sycl(ctx, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, so, H, n_proc, sq1, sq2, sv1, sv2, sb1, sb2, neqk1,
+                        scale, s_ids, s_row_stride, stream);
+            if (n_tail != 0) {
+                launch_gated_delta_net<false, true>(q_d + n_proc * sq2, k_d + n_proc * sq2, v_d + n_proc * sv2,
+                    g_d + n_proc * sb2, b_d + n_proc * sb2, mid.get(), dst_d + n_proc * S_v * H, state_d,
+                    S_v, H, n_tail, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, nullptr, 0, stream);
+            }
+            return;
+        }
         if (!chunk_off && S_v == GDN_CH_S && n_seqs == 1 && neq3 == 1 && n_proc >= 64) {
             if (n_tail == 0) {
                 float * so = state_d;  // final state straight to its destination (dst tail or cache slot 0)
