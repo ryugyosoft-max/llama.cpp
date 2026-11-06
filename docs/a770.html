@@ -302,7 +302,7 @@ td.g { color: var(--ink); }
       <tr><td>Bonsai 2 27B PTQ1_0</td><td class="n us">262 GB/s</td><td class="n">60%</td><td class="n">344 GB/s</td><td class="n">81%</td></tr>
       <tr><td>Bonsai 2 9B PTQ1_0</td><td class="n us">279 GB/s</td><td class="n">64%</td><td class="n">309 GB/s</td><td class="n">73%</td></tr>
     </tbody></table></div>
-    <p class="note">モデルファイルのサイズ × tg128 の速度で求めた概算です。Q4_0 / Q4_K は A770 でも読み出し上限の 8〜9 割まで使えていますが、三値（PTQ1_0）はまだ 6 割台で、残りの伸びしろはこの行列ベクトル積にあります。</p>
+    <p class="note">モデルファイルのサイズ × tg128 の速度で求めた概算です。Q4_0 / Q4_K は A770 でも読み出し上限の 8〜9 割まで使えていますが、三値（PTQ1_0）はまだ 6 割台です。三値の行列ベクトル積は、重みを読むだけの速さより約 3 割遅く、そこが残りの差です。重みを展開しやすい 2bit 形式に並べ替える手も試しましたが、データが 21% 増えるぶん相殺され、互角止まりでした。</p>
   </section>
 
   <section>
