@@ -17,3 +17,8 @@ bool ggml_sycl_op_fwht_signed(ggml_backend_sycl_context & ctx, const ggml_tensor
                               ggml_tensor * dst);
 
 #endif  // GGML_SYCL_FWHT_HPP
+
+// [a770-opt] one row of K = 4096: [residual add +] RMS norm * w + sign flip + 4096-point rotation in one kernel;
+// add_out / normed may be null (not needed after). False = not taken.
+bool ggml_sycl_fwht4096_add_norm_rot(ggml_backend_sycl_context & ctx, const float * a, const float * b, float * add_out,
+                                     const float * w, float eps, float * normed, const float * signs, ggml_tensor * mm);

@@ -8825,7 +8825,9 @@ static bool ggml_sycl_try_add_norm_rot(ggml_backend_sycl_context & ctx, ggml_cgr
                 !ggml_are_same_shape(add->src[1], add))) {
         return false;
     }
-    // rotation tail: MUL(signs) + RESHAPE + MUL_MAT(hint Hadamard 1024)
+    // rotation tail: MUL(signs) + RESHAPE + MUL_MAT(hint Hadamard 1024; [a770-opt] or 4096 for one row, fwht.cpp)
+    const bool r4096 = K == 4096 && M == 1 && ggml_sycl_device_is_alchemist(ctx.device) &&
+                       ggml_sycl_knob("GGML_SYCL_FWHT4096", 1) && ggml_sycl_knob("GGML_SYCL_FWHT_NORM", 1);
     ggml_tensor * mm    = nullptr;
     const float * signs = nullptr;
     if (in + 4 < cgraph->n_nodes) {
@@ -8835,7 +8837,8 @@ static bool ggml_sycl_try_add_norm_rot(ggml_backend_sycl_context & ctx, ggml_cgr
         const ggml_tensor * sg = ms->src[1];
         if (ms->op == GGML_OP_MUL && ms->src[0] == mulw && rs->op == GGML_OP_RESHAPE && rs->src[0] == ms &&
             mt->op == GGML_OP_MUL_MAT && mt->src[1] == rs && ggml_get_op_params_i32(mt, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
-            mt->src[0]->ne[0] == 1024 && f32c(mt) && f32c(ms) && sg && f32c(sg) && sg->ne[0] == K && ggml_nrows(sg) == 1) {
+            (mt->src[0]->ne[0] == 1024 || (r4096 && mt->src[0]->ne[0] == 4096)) && f32c(mt) && f32c(ms) && sg && f32c(sg) &&
+            sg->ne[0] == K && ggml_nrows(sg) == 1) {
             mm    = mt;
             signs = (const float *) sg->data;
         }
@@ -8854,7 +8857,8 @@ static bool ggml_sycl_try_add_norm_rot(ggml_backend_sycl_context & ctx, ggml_cgr
             const ggml_tensor * sg = ms->src[1];
             if (!done[j] && !done[j + 1] && !done[j + 2] && rs->op == GGML_OP_RESHAPE && rs->src[0] == ms &&
                 mt->op == GGML_OP_MUL_MAT && mt->src[1] == rs && ggml_get_op_params_i32(mt, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
-                mt->src[0]->ne[0] == 1024 && f32c(mt) && f32c(ms) && sg && f32c(sg) && sg->ne[0] == K && ggml_nrows(sg) == 1 &&
+                (mt->src[0]->ne[0] == 1024 || (r4096 && mt->src[0]->ne[0] == 4096)) && f32c(mt) && f32c(ms) && sg && f32c(sg) &&
+                sg->ne[0] == K && ggml_nrows(sg) == 1 &&
                 sg->op == GGML_OP_NONE) {  // the signs are read early: they must be a weight, not computed in between
                 bool clear = true;  // nodes computed between the norm and the rotation must not touch the rotation output
                 for (int k = in + 2; k < j && clear; ++k) {
@@ -8924,6 +8928,13 @@ static bool ggml_sycl_try_add_norm_rot(ggml_backend_sycl_context & ctx, ggml_cgr
     }
     float eps;
     memcpy(&eps, norm->op_params, sizeof(float));
+    if (mm && mm->src[0]->ne[0] == 4096) {
+        if (!ggml_sycl_fwht4096_add_norm_rot(ctx, add ? (const float *) add->src[0]->data : (const float *) x->data,
+                                             add ? (const float *) add->src[1]->data : nullptr, add_out,
+                                             (const float *) w->data, eps, normed, signs, mm)) {
+            return false;
+        }
+    } else
     // [a770-opt] decode (one row, no rotation): 32-bit indices, 1024 work-items (the t2 kernel's 64-bit index math is
     // emulated on Xe; it cost ~12 us per call in-model). GGML_SYCL_ADD_NORM1=0 restores it.
     if (!mm && M == 1 && K % 1024 == 0 && K <= 16384 && ggml_sycl_knob("GGML_SYCL_ADD_NORM1", 1)) {

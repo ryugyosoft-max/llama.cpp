@@ -750,6 +750,112 @@ static bool fwht_run(ggml_backend_sycl_context & ctx, const ggml_tensor * src, g
 
 } // namespace fwht_signed_impl
 
+// [a770-opt] one row of 4096: [residual add +] RMS norm * w + sign flip + 4096-point rotation in one work-group of
+// 1024 (4 values per work-item: few registers - a 256-wide version with 16 values plus four input streams spilled and
+// lost to the separate kernels). Element i = k * 1024 + t: bits 10..11 are the register index, bits 0..3 the lane;
+// one SLM transpose then gives work-item t' = hi2 * 64 + lo4 * 4 ... the elements lo4 | lane' << 4 | k' << 8 | hi2 << 10
+// (lane' = bits 4..7 through shuffles, k' = bits 8..9 in registers).
+bool ggml_sycl_fwht4096_add_norm_rot(ggml_backend_sycl_context & ctx, const float * a, const float * b, float * add_out,
+                                     const float * w, float eps, float * normed, const float * signs, ggml_tensor * mm) {
+    if (!ggml_sycl_knob("GGML_SYCL_FWHT4096", ggml_sycl_device_is_alchemist(ctx.device) ? 1 : 0) ||
+        !ggml_sycl_knob("GGML_SYCL_FWHT_NORM", 1) || mm->type != GGML_TYPE_F32 || ggml_nelements(mm) != 4096) {
+        return false;
+    }
+    ggml_sycl_xe1_stash_drop_range(mm->data, ggml_nbytes(mm));
+    float * dst = (float *) mm->data;
+    ctx.stream()->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> sl(sycl::range<1>(4096 + 256), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(1024, 1024), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const auto sg   = it.get_sub_group();
+            const int  t    = (int) it.get_local_id(0);
+            const int  lane = sg.get_local_linear_id();
+            float *    s    = sl.get_multi_ptr<sycl::access::decorated::no>().get();
+            float      v[4], ss = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const int i = k * 1024 + t;
+                float     x = a[i];
+                if (b) {
+                    x += b[i];
+                }
+                v[k] = x;
+                ss += x * x;
+            }
+            ss                = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+            const float rnorm = sycl::rsqrt(ss / 4096 + eps);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const int i = k * 1024 + t;
+                if (add_out) {
+                    add_out[i] = v[k];
+                }
+                const float y = v[k] * rnorm * w[i];
+                if (normed) {
+                    normed[i] = y;
+                }
+                v[k] = y * signs[i] * (1.0f / 64.0f);
+            }
+            // bits 10..11 (registers)
+#pragma unroll
+            for (int h = 1; h < 4; h *= 2) {
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    if ((k & h) == 0) {
+                        const float x = v[k], y = v[k + h];
+                        v[k] = x + y;
+                        v[k + h] = x - y;
+                    }
+                }
+            }
+            // bits 0..3 (lanes)
+#pragma unroll
+            for (int h = 1; h < 16; h *= 2) {
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const float o = sycl::permute_group_by_xor(sg, v[k], h);
+                    v[k] = (lane & h) == 0 ? v[k] + o : o - v[k];
+                }
+            }
+            auto pad = [](int i) { return i + (i >> 4); };  // one float of padding per 16: conflict-free strided reads
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                s[pad(k * 1024 + t)] = v[k];
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+            // work-item t = (hi2 << 8) | (lo4 << 4) | lane' ... holds lo4 | lane' << 4 | k' << 8 | hi2 << 10
+            const int lo4 = (t >> 4) & 15, hi2 = t >> 8;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                v[k] = s[pad(lo4 | (lane << 4) | (k << 8) | (hi2 << 10))];
+            }
+#pragma unroll
+            for (int h = 1; h < 16; h *= 2) {  // bits 4..7 (lanes)
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const float o = sycl::permute_group_by_xor(sg, v[k], h);
+                    v[k] = (lane & h) == 0 ? v[k] + o : o - v[k];
+                }
+            }
+#pragma unroll
+            for (int h = 1; h < 4; h *= 2) {  // bits 8..9 (registers)
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    if ((k & h) == 0) {
+                        const float x = v[k], y = v[k + h];
+                        v[k] = x + y;
+                        v[k + h] = x - y;
+                    }
+                }
+            }
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                dst[lo4 | (lane << 4) | (k << 8) | (hi2 << 10)] = v[k];
+            }
+        });
+    });
+    return true;
+}
+
 bool ggml_sycl_op_fwht_signed(ggml_backend_sycl_context & ctx, const ggml_tensor * src, const ggml_tensor * signs,
                               ggml_tensor * dst) {
     return fwht_signed_impl::fwht_run(ctx, src, dst, signs);
