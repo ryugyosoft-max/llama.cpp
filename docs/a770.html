@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Intel Arc A770を、現役のRTX 5060と同水準までチューニングしてみた</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..100,500..800&family=IBM+Plex+Sans+JP:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one reading column; the hero is a scoreboard (before -> after), then charts, the full table, how, lessons, method. */
+:root {
+  --bg: #f2f4f6;
+  --paper: #ffffff;
+  --ink: #16202a;
+  --muted: #5b6876;
+  --rule: #d6dce3;
+  --us: #2747d0;
+  --us-soft: #e3e8fb;
+  --rtx: #4f8a00;
+  --rtx-bar: #76b900;
+  --vk: #c3cad3;
+  --sy: #9aa5b2;
+  --pb: #6c7988;
+  --win: #2747d0;
+  --display: "Archivo", "IBM Plex Sans JP", system-ui, sans-serif;
+  --body: "IBM Plex Sans JP", "Hiragino Sans", "Noto Sans JP", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f141a; --paper: #161d25; --ink: #e5eaf0; --muted: #9aa6b3; --rule: #2a3440;
+    --us: #8098ff; --us-soft: #1d2747; --rtx: #8fd11a; --rtx-bar: #76b900; --vk: #3a4552; --sy: #55626f; --pb: #7a8795; --win: #8098ff;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f141a; --paper: #161d25; --ink: #e5eaf0; --muted: #9aa6b3; --rule: #2a3440;
+  --us: #8098ff; --us-soft: #1d2747; --rtx: #8fd11a; --rtx-bar: #76b900; --vk: #3a4552; --sy: #55626f; --pb: #7a8795; --win: #8098ff;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font: 400 15px/1.75 var(--body); }
+.wrap { max-width: 980px; margin: 0 auto; padding-block: 40px 72px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 56px; }
+h1, h2, h3 { font-family: var(--display); text-wrap: balance; margin: 0; }
+h1 { font-size: clamp(30px, 5.4vw, 52px); line-height: 1.12; font-weight: 800; font-stretch: 85%; letter-spacing: -0.01em; }
+h2 { font-size: 24px; font-weight: 700; font-stretch: 90%; }
+h3 { font-size: 16px; font-weight: 700; font-family: var(--body); }
+p { margin: 0; }  /* paragraphs span the column, flush with the cards and tables */
+.eyebrow { font: 500 12px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+section { display: grid; gap: 18px; min-width: 0; }
+.lead { color: var(--muted); font-size: 16px; }
+code, .mono { font-family: var(--mono); font-size: .92em; }
+
+/* hero scoreboard */
+.hero { display: grid; gap: 22px; }
+.score { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+.tile { background: var(--paper); border: 1px solid var(--rule); border-radius: 6px; padding: 16px 18px; display: grid; gap: 6px; min-width: 0; }
+.tile .k { font-size: 13px; color: var(--muted); }
+.tile .big { font: 800 40px/1 var(--display); font-stretch: 80%; color: var(--us); font-variant-numeric: tabular-nums; }
+.tile .big small { font-size: 18px; font-weight: 600; color: var(--muted); margin-left: 4px; }
+.tile .sub { font: 400 13px/1.5 var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+.tile .sub b { color: var(--ink); font-weight: 500; }
+.verdict { display: flex; flex-wrap: wrap; gap: 8px; }
+.pill { font: 500 13px/1 var(--body); padding: 7px 10px; border-radius: 999px; border: 1px solid var(--rule); background: var(--paper); }
+.pill b { color: var(--win); font-weight: 700; }
+
+/* charts */
+.chart { background: var(--paper); border: 1px solid var(--rule); border-radius: 6px; padding: 18px 18px 12px; display: grid; gap: 18px; min-width: 0; }
+.grp { display: grid; grid-template-columns: 120px 1fr; gap: 12px; align-items: start; }
+.gl { display: grid; line-height: 1.3; }
+.gl b { font-size: 14px; }
+.gl span { font-size: 12px; color: var(--muted); }
+.bars { display: grid; gap: 4px; min-width: 0; }
+.row { display: grid; grid-template-columns: 150px 1fr 58px; gap: 8px; align-items: center; font-size: 12px; }
+.rl { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rv { font: 500 12px/1 var(--mono); text-align: right; font-variant-numeric: tabular-nums; }
+.track { height: 12px; background: transparent; position: relative; }
+.bar { height: 100%; border-radius: 0 3px 3px 0; }
+.c-vk { background: var(--vk); } .c-sy { background: var(--sy); } .c-pb { background: var(--pb); }
+.c-us { background: var(--us); }
+.c-rtx { background: var(--rtx-bar); }
+.row:has(.c-us) .rl, .row:has(.c-us) .rv { color: var(--us); font-weight: 700; }
+.row.ref .rl, .row.ref .rv { color: var(--rtx); }
+.axis { display: grid; grid-template-columns: 120px 1fr; gap: 12px; font: 400 11px/1 var(--mono); color: var(--muted); }
+.axis .ticks { position: relative; height: 14px; margin-left: 158px; margin-right: 66px; border-top: 1px solid var(--rule); }
+.axis .ticks span { position: absolute; top: 4px; transform: translateX(-50%); }
+.axis .unit { grid-column: 2; text-align: right; }
+.note { font-size: 12.5px; color: var(--muted); }
+@media (max-width: 640px) {
+  .grp, .axis { grid-template-columns: 1fr; }
+  .row { grid-template-columns: 96px 1fr 50px; }
+  .axis .ticks { margin-left: 104px; margin-right: 58px; }
+  .axis .gl { display: none; }
+  .axis .unit { grid-column: 1; }
+}
+
+/* table */
+.tw { overflow-x: auto; background: var(--paper); border: 1px solid var(--rule); border-radius: 6px; }
+table { border-collapse: collapse; width: 100%; min-width: 820px; font-size: 13px; }
+th { font: 500 11.5px/1.35 var(--body); color: var(--muted); text-align: right; padding: 10px 10px; border-bottom: 1px solid var(--rule); vertical-align: bottom; }
+th:first-child, th:nth-child(2) { text-align: left; }
+td { padding: 6px 10px; border-bottom: 1px solid var(--rule); }
+tr.gs td { border-top: 2px solid var(--rule); }
+td.m { vertical-align: top; line-height: 1.35; }
+td.m span { font-size: 12px; color: var(--muted); }
+td.t { font-family: var(--mono); color: var(--muted); }
+td.n { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+td.us { color: var(--us); font-weight: 500; background: var(--us-soft); }
+td.g { color: var(--ink); }
+.win { color: var(--win); font-weight: 500; }
+
+/* where we went down to the assembly */
+.asm { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 12px; }
+.asm .card { background: var(--paper); border: 1px solid var(--rule); border-top: 3px solid var(--us); border-radius: 6px; padding: 16px 18px; display: grid; gap: 10px; align-content: start; min-width: 0; }
+.asm .where { font: 500 12px/1 var(--mono); letter-spacing: .06em; color: var(--muted); }
+.asm .claim { font: 800 19px/1.4 var(--body); color: var(--us); }
+.asm p { font-size: 14px; }
+.asm .num { font: 500 13px/1.5 var(--mono); color: var(--us); font-variant-numeric: tabular-nums; }
+.asm .card.lib { border-top-color: var(--pb); }
+.asm .card.lib .claim { color: var(--ink); }
+.soft { font-size: 14px; color: var(--muted); }
+
+.reuse { background: var(--paper); border: 1px solid var(--rule); border-left: 4px solid var(--us); border-radius: 6px; padding: 20px 22px; gap: 12px; }
+.reuse p { font-size: 15.5px; }
+
+/* memory bandwidth figure */
+.bw { background: var(--paper); border: 1px solid var(--rule); border-radius: 6px; padding: 18px; display: grid; gap: 10px; min-width: 0; }
+.bwrow { display: grid; grid-template-columns: 190px 1fr 120px; gap: 10px; align-items: center; font-size: 13px; }
+.bwrow .lab { color: var(--muted); }
+.bwrow .val { font: 500 13px/1.2 var(--mono); text-align: right; font-variant-numeric: tabular-nums; }
+.bwrow .trk { height: 16px; position: relative; }
+.bwrow .fill { height: 100%; border-radius: 0 3px 3px 0; }
+.bwrow .nom-us { border: 2px dashed var(--us); border-left-width: 0; background: transparent; }
+.bwrow .nom-rtx { border: 2px dashed var(--rtx-bar); border-left-width: 0; background: transparent; }
+.bwrow .mes-us { background: var(--us); }
+.bwrow .mes-rtx { background: var(--rtx-bar); }
+.bwrow.us .val b { color: var(--us); } .bwrow.rtx .val b { color: var(--rtx); }
+.bwsep { height: 6px; }
+.bwaxis { display: grid; grid-template-columns: 190px 1fr 120px; gap: 10px; font: 400 11px/1 var(--mono); color: var(--muted); }
+.bwaxis .tk { position: relative; height: 14px; border-top: 1px solid var(--rule); }
+.bwaxis .tk span { position: absolute; top: 4px; transform: translateX(-50%); }
+@media (max-width: 640px) { .bwrow, .bwaxis { grid-template-columns: 1fr 90px; } .bwrow .trk { grid-column: 1 / -1; grid-row: 2; } .bwaxis .sp { display: none; } .bwaxis .tk { grid-column: 1 / -1; } }
+.tw.small table { min-width: 560px; }
+
+/* how / lessons */
+.how { display: grid; gap: 14px; }
+.step { display: grid; grid-template-columns: 170px 1fr; gap: 16px; padding-top: 14px; border-top: 1px solid var(--rule); }
+.step .tag { font: 500 12px/1.4 var(--mono); color: var(--muted); }
+.step .tag b { display: block; font: 700 15px/1.3 var(--body); color: var(--ink); margin-bottom: 4px; }
+.step ul { margin: 0; padding-left: 1.1em; display: grid; gap: 4px; }
+
+.res { font-family: var(--mono); font-size: 12.5px; color: var(--us); font-variant-numeric: tabular-nums; }
+@media (max-width: 640px) { .step { grid-template-columns: 1fr; gap: 6px; } }
+.lessons { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+.lesson { background: var(--paper); border: 1px solid var(--rule); border-radius: 6px; padding: 14px 16px; display: grid; gap: 6px; align-content: start; }
+.lesson p { font-size: 14px; color: var(--muted); }
+.lesson.key { border: 2px solid var(--us); background: var(--us-soft); grid-column: 1 / -1; }
+.lesson.key h3 { font: 800 22px/1.3 var(--display); font-stretch: 85%; color: var(--us); }
+.lesson.key p { font-size: 15px; color: var(--ink); }
+.hl { color: var(--us); font-weight: 700; }
+.method { display: grid; grid-template-columns: max-content 1fr; gap: 6px 18px; font-size: 13.5px; }
+.method dt { color: var(--muted); }
+.method dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+@media (max-width: 640px) { .method { grid-template-columns: 1fr; } .method dd { margin-bottom: 8px; } }
+</style>
+
+<div class="wrap">
+  <header class="hero">
+    <div class="eyebrow">Intel Arc A770 16GB · llama.cpp SYCL · 2026-11</div>
+    <h1>Intel Arc A770を、現役のRTX 5060と同水準までチューニングしてみた</h1>
+    <p class="lead">Intel 最上位の Alchemist GPU で、公式の llama.cpp から始めて SYCL バックエンドを書き換えた記録です。プリフィル（プロンプト読み込み）は 4 モデルとも GeForce RTX 5060 とほぼ同じか上回り、デコード（文章生成）は 9B 以下のモデルで 90〜93% まで迫りました。</p>
+    <div class="score">
+      <div class="tile"><span class="k">Bonsai 2 9B（三値）の生成速度</span><span class="big">140.7<small>t/s</small></span><span class="sub">公式 Vulkan <b>26.1</b> → <b>5.4×</b><br>RTX 5060 155.5 の <b>90%</b></span></div>
+      <div class="tile"><span class="k">Llama 2 7B Q4_0 のプリフィル</span><span class="big">3,673<small>t/s</small></span><span class="sub">公式 Vulkan <b>1,301</b> → <b>2.8×</b><br>RTX 5060 3,634 を上回る</span></div>
+      <div class="tile"><span class="k">Qwen3.5 9B Q4_K_M の生成速度</span><span class="big">66.1<small>t/s</small></span><span class="sub">公式 Vulkan <b>38.0</b> → <b>1.7×</b><br>RTX 5060 70.8 の <b>93%</b></span></div>
+      <div class="tile"><span class="k">Bonsai 2 27B（三値）の生成速度</span><span class="big">44.2<small>t/s</small></span><span class="sub">公式 Vulkan（Q2_0）<b>16.0</b> → <b>2.8×</b><br>RTX 5060 57.9 の <b>76%</b></span></div>
+    </div>
+    <div class="verdict">
+      <span class="pill">プリフィル pp512：4 モデルとも 5060 の <b>99〜101%</b></span>
+      <span class="pill">pp2048：Llama 2 7B で 5060 の <b>110%</b></span>
+      <span class="pill">デコード tg128：9B 以下で 5060 の <b>90〜93%</b>（27B は 76%）</span>
+      <span class="pill">精度：パープレキシティは誤差内で不変</span>
+    </div>
+  </header>
+
+  <section class="reuse">
+    <div class="eyebrow">Why bother</div>
+    <h2>発売時の相手は RTX 3060 だった</h2>
+    <p>A770 が出た 2022 年、Intel が比較相手に選んだのは GeForce RTX 3060 でした。それから 4 年、同じカードがソフトウェアのチューニングだけで、現行世代の GeForce RTX 5060 と同じ水準の数字を出しています。<b class="hl">ハードウェアは 1 枚も買い足していません。</b></p>
+    <p>VRAM 16GB のカードが手に入りにくい今、引き出しで眠っている A770 があるなら、ローカル LLM 用の 1 枚としてもう一度挿してみる価値があります。9B クラスのモデルなら 256K トークンの文脈まで載り、三値の Bonsai 2 なら 27B も動きます。</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">文章生成 · tg128</div>
+    <h2>生成速度（1 トークンずつ出す速さ）</h2>
+    <div class="chart" role="img" aria-label="tg128 の比較">
+<div class="grp"><div class="gl"><b>Llama 2 7B</b><span>Q4_0</span></div><div class="bars">
+<div class="row"><span class="rl">公式 llama.cpp Vulkan</span><div class="track"><div class="bar c-vk" style="width:25.87%"></div></div><span class="rv">41.4</span></div>
+<div class="row"><span class="rl">公式 llama.cpp SYCL</span><div class="track"><div class="bar c-sy" style="width:34.12%"></div></div><span class="rv">54.6</span></div>
+<div class="row"><span class="rl">PrismML フォーク （改造前）</span><div class="track"><div class="bar c-pb" style="width:34.42%"></div></div><span class="rv">55.1</span></div>
+<div class="row"><span class="rl">今回の A770 版</span><div class="track"><div class="bar c-us" style="width:56.96%"></div></div><span class="rv">91.1</span></div>
+<div class="row ref"><span class="rl">RTX 5060（手元の実測）</span><div class="track"><div class="bar c-rtx" style="width:61.19%"></div></div><span class="rv">97.9</span></div>
+</div></div>
+<div class="grp"><div class="gl"><b>Qwen3.5 9B</b><span>Q4_K_M</span></div><div class="bars">
+<div class="row"><span class="rl">公式 llama.cpp Vulkan</span><div class="track"><div class="bar c-vk" style="width:23.76%"></div></div><span class="rv">38.0</span></div>
+<div class="row"><span class="rl">公式 llama.cpp SYCL</span><div class="track"><div class="bar c-sy" style="width:30.77%"></div></div><span class="rv">49.2</span></div>
+<div class="row"><span class="rl">PrismML フォーク （改造前）</span><div class="track"><div class="bar c-pb" style="width:33.19%"></div></div><span class="rv">53.1</span></div>
+<div class="row"><span class="rl">今回の A770 版</span><div class="track"><div class="bar c-us" style="width:41.28%"></div></div><span class="rv">66.0</span></div>
+<div class="row ref"><span class="rl">RTX 5060（手元の実測）</span><div class="track"><div class="bar c-rtx" style="width:44.25%"></div></div><span class="rv">70.8</span></div>
+</div></div>
+<div class="grp"><div class="gl"><b>Bonsai 2 9B</b><span>三値 PTQ1_0 *</span></div><div class="bars">
+<div class="row"><span class="rl">公式 llama.cpp Vulkan</span><div class="track"><div class="bar c-vk" style="width:16.33%"></div></div><span class="rv">26.1</span></div>
+<div class="row"><span class="rl">公式 llama.cpp SYCL</span><div class="track"><div class="bar c-sy" style="width:18.81%"></div></div><span class="rv">30.1</span></div>
+<div class="row"><span class="rl">PrismML フォーク （改造前）</span><div class="track"><div class="bar c-pb" style="width:36.92%"></div></div><span class="rv">59.1</span></div>
+<div class="row"><span class="rl">今回の A770 版</span><div class="track"><div class="bar c-us" style="width:87.93%"></div></div><span class="rv">140.7</span></div>
+<div class="row ref"><span class="rl">RTX 5060（手元の実測）</span><div class="track"><div class="bar c-rtx" style="width:97.19%"></div></div><span class="rv">155.5</span></div>
+</div></div>
+<div class="grp"><div class="gl"><b>Bonsai 2 27B</b><span>三値 PTQ1_0 *</span></div><div class="bars">
+<div class="row"><span class="rl">公式 llama.cpp Vulkan</span><div class="track"><div class="bar c-vk" style="width:9.97%"></div></div><span class="rv">16.0</span></div>
+<div class="row"><span class="rl">公式 llama.cpp SYCL</span><div class="track"><div class="bar c-sy" style="width:6.04%"></div></div><span class="rv">9.7</span></div>
+<div class="row"><span class="rl">PrismML フォーク （改造前）</span><div class="track"><div class="bar c-pb" style="width:16.86%"></div></div><span class="rv">27.0</span></div>
+<div class="row"><span class="rl">今回の A770 版</span><div class="track"><div class="bar c-us" style="width:27.61%"></div></div><span class="rv">44.2</span></div>
+<div class="row ref"><span class="rl">RTX 5060（手元の実測）</span><div class="track"><div class="bar c-rtx" style="width:36.19%"></div></div><span class="rv">57.9</span></div>
+</div></div>
+<div class="axis"><span class="gl"></span><div class="ticks"><span style="left:0.00%">0</span><span style="left:25.00%">40</span><span style="left:50.00%">80</span><span style="left:75.00%">120</span><span style="left:100.00%">160</span></div><span class="unit">トークン/秒</span></div></div>
+    <p class="note">* 公式版は Prism 独自の三値形式 PTQ1_0 を読めないため、同じ重みの 2bit 版（Q2_0）で測っています。緑は GeForce RTX 5060 の実測値です。</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">プロンプト読み込み · pp512</div>
+    <h2>プリフィル速度（入力を読む速さ）</h2>
+    <div class="chart" role="img" aria-label="pp512 の比較">
+<div class="grp"><div class="gl"><b>Llama 2 7B</b><span>Q4_0</span></div><div class="bars">
+<div class="row"><span class="rl">公式 llama.cpp Vulkan</span><div class="track"><div class="bar c-vk" style="width:32.52%"></div></div><span class="rv">1,301</span></div>
+<div class="row"><span class="rl">公式 llama.cpp SYCL</span><div class="track"><div class="bar c-sy" style="width:42.86%"></div></div><span class="rv">1,714</span></div>
+<div class="row"><span class="rl">PrismML フォーク （改造前）</span><div class="track"><div class="bar c-pb" style="width:43.52%"></div></div><span class="rv">1,741</span></div>
+<div class="row"><span class="rl">今回の A770 版</span><div class="track"><div class="bar c-us" style="width:91.82%"></div></div><span class="rv">3,673</span></div>
+<div class="row ref"><span class="rl">RTX 5060（手元の実測）</span><div class="track"><div class="bar c-rtx" style="width:90.85%"></div></div><span class="rv">3,634</span></div>
+</div></div>
+<div class="grp"><div class="gl"><b>Qwen3.5 9B</b><span>Q4_K_M</span></div><div class="bars">
+<div class="row"><span class="rl">公式 llama.cpp Vulkan</span><div class="track"><div class="bar c-vk" style="width:20.94%"></div></div><span class="rv">838</span></div>
+<div class="row"><span class="rl">公式 llama.cpp SYCL</span><div class="track"><div class="bar c-sy" style="width:41.62%"></div></div><span class="rv">1,665</span></div>
+<div class="row"><span class="rl">PrismML フォーク （改造前）</span><div class="track"><div class="bar c-pb" style="width:44.05%"></div></div><span class="rv">1,762</span></div>
+<div class="row"><span class="rl">今回の A770 版</span><div class="track"><div class="bar c-us" style="width:60.97%"></div></div><span class="rv">2,439</span></div>
+<div class="row ref"><span class="rl">RTX 5060（手元の実測）</span><div class="track"><div class="bar c-rtx" style="width:60.92%"></div></div><span class="rv">2,437</span></div>
+</div></div>
+<div class="grp"><div class="gl"><b>Bonsai 2 9B</b><span>三値 PTQ1_0 *</span></div><div class="bars">
+<div class="row"><span class="rl">公式 llama.cpp Vulkan</span><div class="track"><div class="bar c-vk" style="width:8.08%"></div></div><span class="rv">323</span></div>
+<div class="row"><span class="rl">公式 llama.cpp SYCL</span><div class="track"><div class="bar c-sy" style="width:39.48%"></div></div><span class="rv">1,579</span></div>
+<div class="row"><span class="rl">PrismML フォーク （改造前）</span><div class="track"><div class="bar c-pb" style="width:55.26%"></div></div><span class="rv">2,210</span></div>
+<div class="row"><span class="rl">今回の A770 版</span><div class="track"><div class="bar c-us" style="width:67.89%"></div></div><span class="rv">2,715</span></div>
+<div class="row ref"><span class="rl">RTX 5060（手元の実測）</span><div class="track"><div class="bar c-rtx" style="width:67.47%"></div></div><span class="rv">2,699</span></div>
+</div></div>
+<div class="grp"><div class="gl"><b>Bonsai 2 27B</b><span>三値 PTQ1_0 *</span></div><div class="bars">
+<div class="row"><span class="rl">公式 llama.cpp Vulkan</span><div class="track"><div class="bar c-vk" style="width:4.22%"></div></div><span class="rv">169</span></div>
+<div class="row"><span class="rl">公式 llama.cpp SYCL</span><div class="track"><div class="bar c-sy" style="width:12.95%"></div></div><span class="rv">518</span></div>
+<div class="row"><span class="rl">PrismML フォーク （改造前）</span><div class="track"><div class="bar c-pb" style="width:16.06%"></div></div><span class="rv">642</span></div>
+<div class="row"><span class="rl">今回の A770 版</span><div class="track"><div class="bar c-us" style="width:21.46%"></div></div><span class="rv">858</span></div>
+<div class="row ref"><span class="rl">RTX 5060（手元の実測）</span><div class="track"><div class="bar c-rtx" style="width:21.62%"></div></div><span class="rv">865</span></div>
+</div></div>
+<div class="axis"><span class="gl"></span><div class="ticks"><span style="left:0.00%">0</span><span style="left:25.00%">1,000</span><span style="left:50.00%">2,000</span><span style="left:75.00%">3,000</span><span style="left:100.00%">4,000</span></div><span class="unit">トークン/秒</span></div></div>
+  </section>
+
+  <section>
+    <div class="eyebrow">全数値</div>
+    <h2>4 構成 × 4 モデル</h2>
+    <div class="tw"><table><thead><tr><th>モデル</th><th>テスト</th><th>公式 llama.cpp<br>Vulkan</th><th>公式 llama.cpp<br>SYCL</th><th>PrismML フォーク<br>（改造前）</th><th>今回の A770 版</th><th>RTX 5060<br>（手元の実測）</th><th>公式 Vulkan 比</th><th>対 5060</th></tr></thead><tbody>
+<tr class="gs"><td rowspan="3" class="m"><b>Llama 2 7B</b><br><span>Q4_0</span></td><td class="t">pp512</td><td class="n">1,301</td><td class="n">1,714</td><td class="n">1,741</td><td class="n us">3,673</td><td class="n">3,634</td><td class="n g">2.8×</td><td class="n"><span class="win">101%</span></td></tr>
+<tr><td class="t">pp2048</td><td class="n">913</td><td class="n">1,673</td><td class="n">1,693</td><td class="n us">3,500</td><td class="n">3,173</td><td class="n g">3.8×</td><td class="n"><span class="win">110%</span></td></tr>
+<tr><td class="t">tg128</td><td class="n">41.4</td><td class="n">54.6</td><td class="n">55.1</td><td class="n us">91.1</td><td class="n">97.9</td><td class="n g">2.2×</td><td class="n"><span>93%</span></td></tr>
+<tr class="gs"><td rowspan="3" class="m"><b>Qwen3.5 9B</b><br><span>Q4_K_M</span></td><td class="t">pp512</td><td class="n">838</td><td class="n">1,665</td><td class="n">1,762</td><td class="n us">2,439</td><td class="n">2,437</td><td class="n g">2.9×</td><td class="n"><span class="win">100%</span></td></tr>
+<tr><td class="t">pp2048</td><td class="n">779</td><td class="n">1,663</td><td class="n">1,767</td><td class="n us">2,446</td><td class="n">2,637</td><td class="n g">3.1×</td><td class="n"><span>93%</span></td></tr>
+<tr><td class="t">tg128</td><td class="n">38.0</td><td class="n">49.2</td><td class="n">53.1</td><td class="n us">66.0</td><td class="n">70.8</td><td class="n g">1.7×</td><td class="n"><span>93%</span></td></tr>
+<tr class="gs"><td rowspan="3" class="m"><b>Bonsai 2 9B</b><br><span>三値 PTQ1_0 *</span></td><td class="t">pp512</td><td class="n">323</td><td class="n">1,579</td><td class="n">2,210</td><td class="n us">2,715</td><td class="n">2,699</td><td class="n g">8.4×</td><td class="n"><span class="win">101%</span></td></tr>
+<tr><td class="t">pp2048</td><td class="n">313</td><td class="n">1,578</td><td class="n">2,223</td><td class="n us">2,700</td><td class="n">2,626</td><td class="n g">8.6×</td><td class="n"><span class="win">103%</span></td></tr>
+<tr><td class="t">tg128</td><td class="n">26.1</td><td class="n">30.1</td><td class="n">59.1</td><td class="n us">140.7</td><td class="n">155.5</td><td class="n g">5.4×</td><td class="n"><span>90%</span></td></tr>
+<tr class="gs"><td rowspan="3" class="m"><b>Bonsai 2 27B</b><br><span>三値 PTQ1_0 *</span></td><td class="t">pp512</td><td class="n">169</td><td class="n">518</td><td class="n">642</td><td class="n us">858</td><td class="n">865</td><td class="n g">5.1×</td><td class="n"><span>99%</span></td></tr>
+<tr><td class="t">pp2048</td><td class="n">162</td><td class="n">515</td><td class="n">641</td><td class="n us">855</td><td class="n">858</td><td class="n g">5.3×</td><td class="n"><span>100%</span></td></tr>
+<tr><td class="t">tg128</td><td class="n">16.0</td><td class="n">9.7</td><td class="n">27.0</td><td class="n us">44.2</td><td class="n">57.9</td><td class="n g">2.8×</td><td class="n"><span>76%</span></td></tr>
+</tbody></table></div>
+    <p class="note">すべて同じマシンで <code>llama-bench -ngl 999 -fa 1 -p 512,2048 -n 128</code>（5 回平均）。RTX 5060 の列は、同じモデルファイルを使った GeForce RTX 5060 での手元の実測値です。「公式 Vulkan 比」は今回の版 ÷ 公式 Vulkan。</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">Memory bandwidth</div>
+    <h2>カタログでは 25% 広い帯域が、実際にはほぼ同じ</h2>
+    <p>文章生成は、1 トークンごとに重みを全部メモリから読む処理なので、速さの上限はメモリの読み出し速度で決まります。A770 の公称帯域は 560 GB/s で GeForce RTX 5060（448 GB/s）より 25% 広いのですが、<b class="hl">実際に読める速さは約 434 GB/s（公称の 77%）で、RTX 5060 の 426 GB/s（95%）とほぼ並びます。</b>ハードウェアの優位は、ここでほとんど消えています。</p>
+    <div class="bw" role="img" aria-label="公称帯域と読み込み実測の比較">
+<div class="bwrow us"><span class="lab">Arc A770 · 公称</span><div class="trk"><div class="fill nom-us" style="width:93.33%"></div></div><span class="val">560 GB/s</span></div>
+<div class="bwrow us"><span class="lab">Arc A770 · 読み込み実測</span><div class="trk"><div class="fill mes-us" style="width:72.33%"></div></div><span class="val"><b>434 GB/s · 77%</b></span></div>
+<div class="bwsep"></div>
+<div class="bwrow rtx"><span class="lab">RTX 5060 · 公称</span><div class="trk"><div class="fill nom-rtx" style="width:74.67%"></div></div><span class="val">448 GB/s</span></div>
+<div class="bwrow rtx"><span class="lab">RTX 5060 · 読み込み実測</span><div class="trk"><div class="fill mes-rtx" style="width:71.00%"></div></div><span class="val"><b>426 GB/s · 95%</b></span></div>
+<div class="bwaxis"><span class="sp"></span><div class="tk"><span style="left:0.00%">0</span><span style="left:16.67%">100</span><span style="left:33.33%">200</span><span style="left:50.00%">300</span><span style="left:66.67%">400</span><span style="left:83.33%">500</span><span style="left:100.00%">600</span></div><span class="sp">GB/s</span></div>
+    </div>
+    <p class="note">A770 は SYCL の読み出しベンチ、GeForce RTX 5060 は CUDA の測定プログラム（1 GiB を 20 回読み、最速値）での実測です。</p>
+    <h3>生成中に実際に読めている速さ</h3>
+    <div class="tw small"><table><thead><tr><th>モデル</th><th>Arc A770</th><th>読み込み実測比</th><th>RTX 5060</th><th>読み込み実測比</th></tr></thead><tbody>
+      <tr><td>Qwen3.5 9B Q4_K_M</td><td class="n us">374 GB/s</td><td class="n">86%</td><td class="n">401 GB/s</td><td class="n">94%</td></tr>
+      <tr><td>Llama 2 7B Q4_0</td><td class="n us">348 GB/s</td><td class="n">80%</td><td class="n">374 GB/s</td><td class="n">88%</td></tr>
+      <tr><td>Bonsai 2 27B PTQ1_0</td><td class="n us">262 GB/s</td><td class="n">60%</td><td class="n">344 GB/s</td><td class="n">81%</td></tr>
+      <tr><td>Bonsai 2 9B PTQ1_0</td><td class="n us">279 GB/s</td><td class="n">64%</td><td class="n">309 GB/s</td><td class="n">73%</td></tr>
+    </tbody></table></div>
+    <p class="note">モデルファイルのサイズ × tg128 の速度で求めた概算です。Q4_0 / Q4_K は A770 でも読み出し上限の 8〜9 割まで使えていますが、三値（PTQ1_0）はまだ 6 割台で、残りの伸びしろはこの行列ベクトル積にあります。</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">Down to the assembly</div>
+    <h2>どこまで降りたか</h2>
+    <p class="soft">GPU のコードは、ソースが正しくても速いとは限りません。Intel のシェーダコンパイラ（IGC）が実際に出力したアセンブリを 1 命令ずつ読み、遅い理由を見つけたところから書き直しています。重い部分は ESIMD（レジスタの割り当てまで自分で決める、アセンブラに近い書き方）で書きました。</p>
+    <div class="asm">
+      <div class="card lib">
+        <div class="where">プリフィル</div>
+        <div class="claim">アセンブラは不要。行列積は Intel 自身の oneDNN に任せた</div>
+        <p>4bit / 8bit の重みのまま XMX に流す「重み圧縮 GEMM」が oneDNN に用意されていました。llama.cpp の汎用経路はこれを使わず、毎回 f16 に展開してから掛けていました。</p>
+        <div class="num">55〜90 TFLOPS 相当 · Llama pp512 1,849 → 3,761</div>
+      </div>
+      <div class="card">
+        <div class="where">線形アテンション（DeltaNet）</div>
+        <div class="claim">アセンブリを読み、ESIMD でレジスタを手で配置</div>
+        <p>コンパイラはループを展開すると全ロードを先頭へ寄せ、1 スレッドあたり 2〜9 KB をスタックへ溢れさせていました。そのままでは逐次版より遅かったものを、ESIMD で書き直してスピル 0 にしています。</p>
+        <div class="num">スピル 9 KB → 0 · Qwen pp512 2,295 → 2,481</div>
+      </div>
+      <div class="card">
+        <div class="where">生成（デコード）</div>
+        <div class="claim">アセンブリで原因を特定し、XMX の DPAS 命令を ESIMD で直接書いた</div>
+        <p>アセンブリを読むと、16 バイトのロードが 4 バイトずつに分解されていたり、添字計算が 64bit 整数の模倣命令の連鎖になっていたりしました。量子化 KV キャッシュの Flash Attention は、行列演算命令（DPAS）を直接呼ぶ形で書いています。</p>
+        <div class="num">FA デコード 2× · 64bit 添字の除去で約 +10% · Bonsai 59 → 141 t/s</div>
+      </div>
+    </div>
+    <p class="soft">どれも「動くが、A770 向けには詰め切られていない」部分でした。汎用のコンパイラ出力や既存の実装は、より新しい GPU や他社の GPU を主な対象にしていて、Alchemist の癖（64bit 整数を持たない、レジスタ 128 本、XMX の幅 8）までは追い込まれていません。そこを埋めるだけで、この差が出ました。</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">How</div>
+    <h2>何をどうやったか</h2>
+    <div class="how">
+      <div class="step"><div class="tag"><b>土台を選ぶ</b>Vulkan → SYCL</div><ul>
+        <li>公式 Vulkan は Alchemist の XMX（行列演算ユニット）をほぼ使えず、プリフィルが SYCL の半分以下でした。SYCL（oneAPI）に乗り換え、三値モデルを扱える PrismML フォークを起点にしました。</li>
+        <li>以降は Intel のシェーダコンパイラ（IGC）が出すアセンブリを読みながら、カーネル単位で書き換えています。</li></ul></div>
+      <div class="step"><div class="tag"><b>プリフィル</b>行列積</div><ul>
+        <li>4bit / 8bit の重みを f16 に展開してから掛けていたのをやめ、oneDNN の「重み圧縮 GEMM」で量子化重みのまま XMX に流しました。</li>
+        <li>Q4_0 は推論用に並べ替え済みのメモリをそのまま読み、ニブル順の違いは入力側を並べ替えて吸収。Q4_K は最小値の項を「9 番目のグループ」として同じ行列積に畳み込みました。</li>
+        <li class="res">Llama 2 7B pp512：1,849 → 3,761</li></ul></div>
+      <div class="step"><div class="tag"><b>線形アテンション</b>Gated DeltaNet</div><ul>
+        <li>Qwen3.5 / Bonsai の DeltaNet 層は 1 トークンずつ状態を更新する逐次処理でした。32 トークンごとのチャンク形式（UT/WY 変換）に書き換え、チャンク間の逐次部分だけを ESIMD で手書きしてレジスタ溢れを無くしました。</li>
+        <li class="res">Qwen3.5 9B pp512：2,295 → 2,481</li></ul></div>
+      <div class="step"><div class="tag"><b>生成（Llama）</b>行列ベクトル積</div><ul>
+        <li>Q4_0 の行列ベクトル積を「1 レーン 1 ブロック・複数行で入力共有」に書き直し、正規化や SwiGLU が次の積用の 8bit 量子化を自分で書く融合を追加。量子化 KV キャッシュの Flash Attention は XMX（DPAS 命令）で実装しました。</li>
+        <li class="res">Llama 2 7B tg128：55.1 → 91.1</li></ul></div>
+      <div class="step"><div class="tag"><b>生成（三値 Bonsai）</b>1 トークン 16.9 ms → 7.1 ms</div><ul>
+        <li>A770 では使える GPU プロファイラが無かったため、各処理の前に GPU の時計を読む小さなカーネルを差し込んで、1 トークン内の時間配分を可視化するツールを作りました。</li>
+        <li>最大の原因は 64bit 整数の添字計算でした。A770 はこれをハードウェアで持たず数十命令で模倣するため、4,096 要素の正規化に 12 µs かかっていました。添字を 32bit にするだけで約 1 割速くなりました。</li>
+        <li>1 トークンに約 130 回あるアダマール回転（重みの前処理）を、1 ワークグループ・12 回同期から 1,024 スレッド・同期 1 回に。直前の残差加算と正規化、アテンションの出力ゲートもこの中に入れました。</li>
+        <li>DeltaNet の出力処理、アテンションの Q/K 正規化 + RoPE + KV キャッシュ書き込み、ゲート計算、同じ入力を読む行列ベクトル積（qkv + z、gate + up + SwiGLU）をそれぞれ 1 カーネルにまとめ、不要なコピーも削除しました。</li>
+        <li class="res">Bonsai 2 9B tg128：59.1（改造前）→ 140.7</li></ul></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="eyebrow">Lessons</div>
+    <h2>A770 で分かったこと</h2>
+    <div class="lessons">
+      <div class="lesson key"><h3>公称 560 GB/s、実測は約 434 GB/s</h3><p><b class="hl">メモリの読み出しは、どう書いても公称値の約 77% で頭打ちでした。</b>GeForce RTX 5060 は同じ測り方で公称の 95% が出ます。文章生成の速さはほぼこの帯域で決まるので、ハードウェアとしていちばん損をしている部分です。ソフトウェアで取り返せたのは、この上限の手前までです。</p></div>
+      <div class="lesson"><h3>64bit 整数はソフトウェア</h3><p>乗算・除算は数十命令に展開されます。小さなカーネルほど添字計算が支配的になるので、オフセットは 32bit で持ちます。</p></div>
+      <div class="lesson"><h3>1 ワークグループのカーネルは重くしない</h3><p>起動回数を 1 つ減らしても、単一ワークグループの処理に仕事を足すと全体は遅くなりました。量子化の同居などは別カーネルの方が速い。</p></div>
+      <div class="lesson"><h3>レジスタは 128 本しかない</h3><p>SIMD16 の float は 1 個で 2 本を使います。ループを展開した SIMT カーネルはすぐ溢れるので、重い部分は ESIMD でレジスタを明示しました。</p></div>
+      <div class="lesson"><h3>大きな縮約は 2 段で</h3><p>1,024 幅の <code>reduce_over_group</code> より、サブグループで足して SLM 経由でもう一度足す方が速い。</p></div>
+      <div class="lesson"><h3>キャッシュと起動の損失</h3><p>L2 に乗った行の読み出しは約 0.8 TB/s が上限。行列ベクトル積は起動ごとに約 9 µs の立ち上がりと末尾の損失があります。</p></div>
+      <div class="lesson"><h3>うまくいかなかったこと</h3><p>三値重みの行列ベクトル積は 6 通り（ESIMD のテーブル展開やベクトル展開を含む）書き直しましたが、どれも既存カーネルより遅く、採用していません。</p></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="eyebrow">Method</div>
+    <h2>測定条件</h2>
+    <dl class="method">
+      <dt>GPU</dt><dd>Intel Arc A770 16GB（Alchemist / DG2、32 Xe コア、最大 2,400 MHz）</dd>
+      <dt>ホスト</dt><dd>Xeon w9-3475X、Ubuntu 26.04.1、Linux 7.0、Intel compute-runtime 26.05.37020、oneAPI 2026.2、Mesa 26.0.8</dd>
+      <dt>比較対象</dt><dd>公式 llama.cpp build 12110（cd959bae9）の Vulkan 版・SYCL 版、PrismML フォークの改造前（62c418c）、今回の版（その上に 39 コミット、ggml-sycl 約 5,700 行）</dd>
+      <dt>計測</dt><dd><code>llama-bench -ngl 999 -fa 1 -p 512,2048 -n 128</code>、5 回平均、既定のバッチ（ubatch 512）</dd>
+      <dt>RTX 5060</dt><dd>GeForce RTX 5060 で、同じモデルファイルを使った手元の実測値（4 モデル全項目）</dd>
+      <dt>正しさ</dt><dd>各段階で test-backend-ops（CPU 実装との比較）とパープレキシティ（デコード経路は 1 トークンずつ）を確認。PPL は誤差の範囲内で不変</dd>
+    </dl>
+  </section>
+</div>
+
+</html>
