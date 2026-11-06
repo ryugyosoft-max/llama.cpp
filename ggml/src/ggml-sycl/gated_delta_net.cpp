@@ -449,6 +449,60 @@ static void launch_gated_delta_net(const float *   q_d,
             return;
         }
     }
+    if constexpr (!KDA && !keep_rs_t) {
+        // [a770-opt] one decode token, S_v = 128: a sub-group per value column, each lane 8 contiguous state rows as two
+        // float4 (the general kernel makes 8 strided 4-byte loads per lane and carries 64-bit index math); same
+        // per-column arithmetic and reduction structure. GGML_SYCL_GDN_DEC1=0 restores the general kernel.
+        static const bool dec1 = !getenv("GGML_SYCL_GDN_DEC1") || atoi(getenv("GGML_SYCL_GDN_DEC1")) != 0;
+        if (dec1 && S_v == 128 && n_tokens == 1 && n_seqs == 1 && sq1 % 4 == 0 && ((uintptr_t) q_d % 16) == 0 &&
+            ((uintptr_t) k_d % 16) == 0 && ((uintptr_t) s_d % 16) == 0 && ((uintptr_t) state_d % 16) == 0 &&
+            s_row_stride % 4 == 0 && H * 128 * 128 < INT32_MAX) {
+            const int Hi = (int) H, sq1i = (int) sq1, sv1i = (int) sv1, sb1i = (int) sb1, nk = (int) neqk1;
+            constexpr int NSG = 8;  // columns per work-group
+            stream->parallel_for(sycl::nd_range<1>((size_t) Hi * (128 / NSG) * NSG * 16, NSG * 16),
+                [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                    const auto sg   = it.get_sub_group();
+                    const int  lane = sg.get_local_linear_id();
+                    const int  grp  = (int) it.get_group(0);
+                    const int  h    = grp / (128 / NSG);
+                    const int  col  = (grp % (128 / NSG)) * NSG + (int) sg.get_group_linear_id();
+                    const int  hk   = h % nk;
+                    const float * sin = s_d + (s_ids ? (int64_t) s_ids[0] * s_row_stride : (int64_t) 0) + h * 16384 + col * 128 + lane * 8;
+                    const sycl::float4 s0 = *(const sycl::float4 *) sin, s1 = *(const sycl::float4 *) (sin + 4);
+                    const float * kh = k_d + hk * sq1i + lane * 8;
+                    const float * qh = q_d + hk * sq1i + lane * 8;
+                    const sycl::float4 k0 = *(const sycl::float4 *) kh, k1 = *(const sycl::float4 *) (kh + 4);
+                    const sycl::float4 q0 = *(const sycl::float4 *) qh, q1 = *(const sycl::float4 *) (qh + 4);
+                    const float g_val    = sycl::native::exp(g_d[h * sb1i]);
+                    const float beta_val = b_d[h * sb1i];
+                    const float v_col    = v_d[h * sv1i + col];
+                    float st[8] = { s0.x(), s0.y(), s0.z(), s0.w(), s1.x(), s1.y(), s1.z(), s1.w() };
+                    const float kk[8] = { k0.x(), k0.y(), k0.z(), k0.w(), k1.x(), k1.y(), k1.z(), k1.w() };
+                    const float qq[8] = { q0.x(), q0.y(), q0.z(), q0.w(), q1.x(), q1.y(), q1.z(), q1.w() };
+                    float kv = 0.0f;
+#pragma unroll
+                    for (int r = 0; r < 8; ++r) {
+                        kv += st[r] * kk[r];
+                    }
+                    kv = sycl::reduce_over_group(sg, kv, sycl::plus<float>());
+                    const float delta = (v_col - g_val * kv) * beta_val;
+                    float       at    = 0.0f;
+#pragma unroll
+                    for (int r = 0; r < 8; ++r) {
+                        st[r] = g_val * st[r] + kk[r] * delta;
+                        at += st[r] * qq[r];
+                    }
+                    at = sycl::reduce_over_group(sg, at, sycl::plus<float>());
+                    if (lane == 0) {
+                        dst_d[h * 128 + col] = at * scale;
+                    }
+                    float * so = state_d + h * 16384 + col * 128 + lane * 8;
+                    *(sycl::float4 *) so       = sycl::float4(st[0], st[1], st[2], st[3]);
+                    *(sycl::float4 *) (so + 4) = sycl::float4(st[4], st[5], st[6], st[7]);
+                });
+            return;
+        }
+    }
     const int warp_size = ggml_sycl_info().devices[ggml_sycl_get_device()].warp_size;
 
     const int num_warps = 4;
