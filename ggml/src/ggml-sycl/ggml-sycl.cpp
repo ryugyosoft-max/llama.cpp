@@ -8407,11 +8407,11 @@ static bool ggml_sycl_try_ptq1_multi(ggml_backend_sycl_context & ctx, ggml_cgrap
         return false;
     }
     if (log > 0) {
-        GGML_LOG_INFO("[ptq1-multi] %s", mm0->name);
+        fprintf(stderr, "[ptq1-multi] %s", mm0->name);
         for (int m = 1; m < nm; ++m) {
-            GGML_LOG_INFO(" + %s (+%d%s)", cgraph->nodes[members[m]]->name, members[m] - i, staged[m] ? ", staged" : "");
+            fprintf(stderr, " + %s (+%d%s)", cgraph->nodes[members[m]]->name, members[m] - i, staged[m] ? ", staged" : "");
         }
-        GGML_LOG_INFO("\n");
+        fprintf(stderr, "\n");
         --log;
     }
     for (int m = 1; m < nm; ++m) {
@@ -9272,6 +9272,26 @@ static bool ggml_sycl_try_conv_chain_impl(ggml_backend_sycl_context & ctx, ggml_
 //   RMS_NORM(per head) -> MUL(ssm_norm w) -> SWIGLU(z, .) -> RESHAPE/PERMUTE views -> CONT
 // One work-group per head reduces its S values and writes silu(z) * norm * w straight to the CONT position (the
 // permuted view inverted per element; the host checks the inverse round-trips). 3 launches -> 1 per DeltaNet layer.
+// [a770-opt] staged mat-vec outputs (ptq1 multi: z) whose copy into the tensor is deferred to their first consumer;
+// the DeltaNet output chain reads the slot directly, any other consumer gets the copy right before it runs
+static std::unordered_map<const ggml_tensor *, const void *> g_staged_redirect;
+
+static const ggml_tensor * ggml_sycl_base_tensor(const ggml_tensor * t) {
+    while (t->view_src) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+static void ggml_sycl_staged_flush(ggml_backend_sycl_context & ctx, const ggml_tensor * t) {
+    const ggml_tensor * b  = ggml_sycl_base_tensor(t);
+    auto                it = g_staged_redirect.find(b);
+    if (it != g_staged_redirect.end()) {
+        SYCL_CHECK(CHECK_TRY_ERROR(ctx.stream()->memcpy(b->data, it->second, ggml_nbytes(b))));
+        g_staged_redirect.erase(it);
+    }
+}
+
 static bool ggml_sycl_try_dn_out_chain(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int & i) {
     if (!ggml_sycl_knob("GGML_SYCL_DN_OUT", 1) || i + 3 >= cgraph->n_nodes) {
         return false;
@@ -9374,6 +9394,14 @@ static bool ggml_sycl_try_dn_out_chain(ggml_backend_sycl_context & ctx, ggml_cgr
     const int64_t onb = (int64_t) o->nb[1];
     const float * wd  = (const float *) w->data;
     const float * zd  = (const float *) z->data;
+    {
+        const ggml_tensor * zb = ggml_sycl_base_tensor(z);
+        auto                rd = g_staged_redirect.find(zb);
+        if (rd != g_staged_redirect.end() && z->data == zb->data) {
+            zd = (const float *) rd->second;  // still in the staging slot: read it there, no copy kernel
+            g_staged_redirect.erase(rd);
+        }
+    }
     float *       dd  = (float *) ct->data;
     const int     Si  = (int) S;
     const int s0 = sh[0], s1 = sh[1], s2 = sh[2], s3 = sh[3];
@@ -9475,6 +9503,29 @@ static bool ggml_sycl_try_dn_gates(ggml_backend_sycl_context & ctx, ggml_cgraph 
     float *          ob    = staged ? sa_out + R * M : (float *) n[8]->data;
     const int        Ki = (int) K, Ri = (int) R, Mi = (int) M;
     constexpr int    WG = 256;
+    if (Mi == 1 && wf32 && Ki == 4096) {
+        // [a770-opt] decode, F32 weights, K = 4096: a 1024-wide work-group per row, one float4 per work-item (all loads
+        // in flight at once)
+        ctx.stream()->parallel_for(sycl::nd_range<1>((size_t) 2 * R * 1024, 1024), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const int     g   = it.get_group(0);
+            const bool    isb = g >= Ri;
+            const int     row = isb ? g - Ri : g;
+            const int     k   = (int) it.get_local_id(0) * 4;
+            const sycl::float4 a4 = *(const sycl::float4 *) ((const float *) (isb ? pb : pa) + row * 4096 + k);
+            const sycl::float4 x4 = *(const sycl::float4 *) (px + k);
+            const float   sum = sycl::reduce_over_group(it.get_group(),
+                                    a4.x() * x4.x() + a4.y() * x4.y() + a4.z() * x4.z() + a4.w() * x4.w(), sycl::plus<float>());
+            if (it.get_local_id(0) == 0) {
+                if (isb) {
+                    ob[row] = 1.0f / (1.0f + sycl::exp(-sum));
+                } else {
+                    const float v  = sum + pbias[row];
+                    const float sp = sycl::fmax(v, 0.0f) + sycl::log1p(sycl::exp(-sycl::fabs(v)));
+                    oa[row] = sp * psa[row];
+                }
+            }
+        });
+    } else
     if (Mi == 1 && wf32) {
         // [a770-opt] decode, F32 weights: one token, 32-bit offsets, no runtime-indexed accumulator array
         ctx.stream()->parallel_for(sycl::nd_range<1>((size_t) 2 * R * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
@@ -9579,6 +9630,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     std::vector<const void *> pending(cgraph->n_nodes, nullptr);
     ggml_sycl_xe1_stash_clear();
     g_conv_gathers.clear();
+    g_staged_redirect.clear();
     const bool                       ht_on   = g_ht.on && cgraph->n_nodes > 500;
     sycl_host_timing::clk::time_point ht_prev = sycl_host_timing::clk::now();
     const char *                     ht_op   = nullptr;
@@ -9643,7 +9695,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             ht_op   = ggml_op_desc(node);
         }
         if (done[i]) {
-            if (pending[i]) {
+            if (pending[i] && ggml_sycl_knob("GGML_SYCL_STAGED_DEFER", 1) && node->view_src == nullptr) {
+                g_staged_redirect[node] = pending[i];  // copied at its first consumer (or read in place)
+            } else if (pending[i]) {
                 SYCL_CHECK(CHECK_TRY_ERROR(sycl_ctx->stream()->memcpy(node->data, pending[i], ggml_nbytes(node))));
             }
             continue;
@@ -9653,6 +9707,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
+        }
+        if (!g_staged_redirect.empty() && node->op != GGML_OP_RMS_NORM) {  // RMS_NORM: the dn_out chain may read in place
+            for (int k = 0; k < GGML_MAX_SRC && node->src[k]; ++k) {
+                ggml_sycl_staged_flush(*sycl_ctx, node->src[k]);
+            }
         }
         if (tl_on) {
             const int slot = (int) g_tl.labels.size();
@@ -9826,6 +9885,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (node->op == GGML_OP_RMS_NORM && ggml_sycl_try_dn_out_chain(*sycl_ctx, cgraph, i)) {
             continue;
         }
+        if (node->op == GGML_OP_RMS_NORM && !g_staged_redirect.empty()) {
+            for (int k = 0; k < GGML_MAX_SRC && node->src[k]; ++k) {
+                ggml_sycl_staged_flush(*sycl_ctx, node->src[k]);
+            }
+        }
         if (node->op == GGML_OP_RMS_NORM &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
             ggml_sycl_op_rms_norm_fused_add(*sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
@@ -9913,6 +9977,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+    }
+    while (!g_staged_redirect.empty()) {  // never consumed in this graph: the tensor still gets its value
+        ggml_sycl_staged_flush(*sycl_ctx, g_staged_redirect.begin()->first);
     }
     if (tl_on) {
         const int slot = (int) g_tl.labels.size();
