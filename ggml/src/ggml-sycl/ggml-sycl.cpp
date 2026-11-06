@@ -45,6 +45,7 @@
 #endif
 
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/experimental/clock.hpp>
 #include <sycl/backend.hpp>
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
 #include <level_zero/ze_api.h>
@@ -4139,7 +4140,9 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
             if (src1_on_device && src1_is_contiguous) {
                 scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
                                                      /*num_src=*/2, " : converting src1 to Q8_1");
+                static const bool skip_q = getenv("GGML_SYCL_SKIP_QUANT") != nullptr;  // timing ablation only
                 try {
+                    if (!(skip_q && nrows1 == 1))
                     quantize_row_q8_1_sycl<quantize_f>(dev[i].src1_ddf, dev[i].src1_ddq, ne10, nrows1, src1_padded_col_size, stream);
                 } catch (sycl::exception const &exc) {
                     std::cerr << "Quantize_row_q8_1_sycl error" << exc.what() << "Exception caught at file:" << __FILE__
@@ -6715,7 +6718,7 @@ static bool ggml_sycl_mul_mat_glu_fused(ggml_backend_sycl_context & ctx, ggml_cg
         // ARC-LAB: the decode-once PTQ1_0 fused kernel reads the chunk-interleaved activation layout
         quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_ptq1_il>((const float *) act->data, src1_ddq, (int) ne00,
                                                                   (int) ne11, src1_padded_cols, stream);
-    } else {
+    } else if (!(getenv("GGML_SYCL_SKIP_QUANT") && ne11 == 1)) {
         quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>((const float *) act->data, src1_ddq, (int) ne00, (int) ne11,
                                                               src1_padded_cols, stream);
     }
@@ -7959,6 +7962,55 @@ struct sycl_op_timing {
 };
 static sycl_op_timing g_ot;
 
+// [a770-opt] GGML_SYCL_TIMELINE=1 (timing only): a one-work-item kernel stamps the device clock before every op group
+// of decode-sized graphs; the stamps are recorded into the SYCL graph like any kernel, read back before the next
+// token, and the clock time between stamps is charged to the op group (plus ~1.3 us of the stamp kernel itself).
+// Every 64 tokens it prints the share of the token per op label (GGML_SYCL_OP_TIMING_SHAPES=1 splits mat-muls).
+struct sycl_timeline {
+    bool                     on = getenv("GGML_SYCL_TIMELINE") && atoi(getenv("GGML_SYCL_TIMELINE"));
+    uint64_t *               dev = nullptr;
+    static constexpr int     MAXS = 4096;
+    std::vector<std::string> labels;
+    bool                     armed = false;
+    int                      graphs = 0;
+    double                   total_ticks = 0;
+    std::map<std::string, std::pair<double, long>> per;
+    std::vector<double> slot_ticks;
+    void collect(sycl::queue & q) {
+        if (!armed || labels.size() < 2) return;
+        std::vector<uint64_t> h(labels.size());
+        q.memcpy(h.data(), dev, h.size() * sizeof(uint64_t)).wait();
+        slot_ticks.resize(h.size(), 0.0);
+        for (size_t k = 0; k + 1 < h.size(); ++k) {
+            const double d = (double) (h[k + 1] - h[k]);
+            slot_ticks[k] += d;
+            auto & a = per[labels[k]];
+            a.first += d;
+            a.second++;
+        }
+        total_ticks += (double) (h.back() - h.front());
+        if (++graphs == 64) {
+            std::vector<std::pair<double, std::string>> v;
+            for (auto & kv : per) v.push_back({ kv.second.first, kv.first });
+            std::sort(v.rbegin(), v.rend());
+            fprintf(stderr, "timeline: %d tokens, %zu stamps per token\n", graphs, labels.size());
+            for (size_t i = 0; i < v.size() && i < 30; ++i) {
+                fprintf(stderr, "timeline:   %-26s %5.1f %%  (%.1f per token)\n", v[i].second.c_str(),
+                        100.0 * v[i].first / total_ticks, (double) per[v[i].second].second / graphs);
+            }
+            static const int seq = getenv("GGML_SYCL_TIMELINE_SEQ") ? atoi(getenv("GGML_SYCL_TIMELINE_SEQ")) : 0;
+            const double ms_tok = getenv("GGML_SYCL_TIMELINE_MS") ? atof(getenv("GGML_SYCL_TIMELINE_MS")) : 0.0;
+            for (int k = 0; k < seq && k + 1 < (int) labels.size(); ++k) {  // per-group span in order (us if the token ms is given)
+                const double frac = slot_ticks[k] / total_ticks;
+                fprintf(stderr, "timeline-seq %4d %-26s %6.2f %s\n", k, labels[k].c_str(),
+                        ms_tok > 0 ? frac * ms_tok * 1000.0 : 100.0 * frac, ms_tok > 0 ? "us" : "%");
+            }
+            graphs = 0; total_ticks = 0; per.clear(); slot_ticks.assign(slot_ticks.size(), 0.0);
+        }
+    }
+};
+static sycl_timeline g_tl;
+
 
 static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
     GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
@@ -8326,6 +8378,7 @@ static bool ggml_sycl_try_ptq1_multi(ggml_backend_sycl_context & ctx, ggml_cgrap
     if (rot_q8) {
         // [a770-opt] quantized by the rotation that produced act
     } else if (ne11 == 1) {
+        if (!getenv("GGML_SYCL_SKIP_QUANT"))
         quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>((const float *) act->data, q8.get(), (int) ne00, 1,
                                                               src1_padded_cols, stream);
     } else {
@@ -8900,7 +8953,82 @@ static bool ggml_sycl_try_add_norm_rot(ggml_backend_sycl_context & ctx, ggml_cgr
 // The nodes are spread over ~15 graph nodes with cache ops in between; the fused outputs are written at the CONCAT's
 // position, so every node computed in between must not touch their memory (checked), and they must not overlap inputs.
 // GGML_SYCL_CONV_CHAIN=0 turns it off.
+// [a770-opt] conv-state GET_ROWS deferred into the conv chain (the chain reads the cache row through the id itself):
+// one kernel less per DeltaNet layer, and the chain's L2 output no longer collides with the gathered state buffer.
+struct ggml_sycl_conv_gather {
+    ggml_tensor *   gr;
+    const float *   base;
+    const int32_t * ids;
+    int64_t         row_stride;  // floats
+};
+static std::unordered_map<const ggml_tensor *, ggml_sycl_conv_gather> g_conv_gathers;  // keyed by the CONCAT node
+
+// GET_ROWS of one conv-state row whose only reader (through RESHAPEs) is CONCAT src[0]: skip it, the chain reads the row
+static bool ggml_sycl_try_conv_gather_skip(ggml_backend_sycl_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_sycl_knob("GGML_SYCL_CONV_CHAIN", 1) || !ggml_sycl_knob("GGML_SYCL_CONV_GATHER", 1)) {
+        return false;
+    }
+    ggml_tensor * gr = cgraph->nodes[node_idx];
+    if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        !ggml_is_contiguous(gr)) {
+        return false;
+    }
+    const ggml_tensor * cache = gr->src[0];
+    const ggml_tensor * ids   = gr->src[1];
+    if (cache->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || !cache->data || !ids->data ||
+        (ids->buffer && ggml_backend_buffer_is_host(ids->buffer)) || cache->nb[0] != sizeof(float) ||
+        cache->nb[1] % sizeof(float) != 0 || !ggml_is_contiguous(ids) || ggml_nelements(ids) != 1 || gr->ne[1] != 1 ||
+        gr->ne[2] != 1 || gr->ne[3] != 1 || gr->ne[0] != cache->ne[0] || ggml_node_get_use_count(cgraph, node_idx) != 1) {
+        return false;
+    }
+    GGML_UNUSED(ctx);
+    const ggml_tensor * cur = gr;
+    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_CONCAT && n->src[0] == cur && cur != gr && ggml_get_op_params_i32(n, 0) == 0 &&
+            ggml_nelements(cur) == ggml_nelements(gr)) {
+            g_conv_gathers[n] = { gr, (const float *) cache->data, (const int32_t *) ids->data,
+                                  (int64_t) (cache->nb[1] / sizeof(float)) };
+            return true;
+        }
+        if (n->op == GGML_OP_RESHAPE && n->src[0] == cur) {
+            if (ggml_node_get_use_count(cgraph, j) != 1) {
+                return false;
+            }
+            cur = n;
+            continue;
+        }
+        for (int t = 0; t < GGML_MAX_SRC; ++t) {
+            if (n->src[t] == cur || n->src[t] == gr) {
+                return false;
+            }
+        }
+        if (n->view_src == gr) {
+            return false;
+        }
+    }
+    return false;
+}
+
+static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst);
+
+static bool ggml_sycl_try_conv_chain_impl(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i,
+                                          std::vector<uint8_t> & done, const ggml_sycl_conv_gather * cg);
+
 static bool ggml_sycl_try_conv_chain(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i, std::vector<uint8_t> & done) {
+    auto it = g_conv_gathers.find(cgraph->nodes[i]);
+    const ggml_sycl_conv_gather * cg = it != g_conv_gathers.end() ? &it->second : nullptr;
+    if (ggml_sycl_try_conv_chain_impl(ctx, cgraph, i, done, cg)) {
+        return true;
+    }
+    if (cg) {
+        ggml_sycl_compute_forward(ctx, cg->gr);  // not fused after all: the gather the chain would have done
+    }
+    return false;
+}
+
+static bool ggml_sycl_try_conv_chain_impl(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i,
+                                          std::vector<uint8_t> & done, const ggml_sycl_conv_gather * cg) {
     if (!ggml_sycl_knob("GGML_SYCL_CONV_CHAIN", 1)) {
         return false;
     }
@@ -8987,12 +9115,20 @@ static bool ggml_sycl_try_conv_chain(ggml_backend_sycl_context & ctx, ggml_cgrap
     static const char * out_names[3] = { "silu", "l2", "cache" };
     static const char * in_names[3]  = { "conv state", "x", "weights" };
     // l2 on top of the conv state (other lanes still read it): leave L2_NORM to its own kernel after this one
-    const bool l2_in = !overlap(outs[1], outn[1], cs->data, ggml_nbytes(cs));
+    const bool l2_in = cg || !overlap(outs[1], outn[1], cs->data, ggml_nbytes(cs));
     for (int o = 0; o < 3; ++o) {
         if (o == 1 && !l2_in) {
             continue;
         }
         for (int t = 0; t < 3; ++t) {
+            if (cg && t == 0) {
+                // the state is read from its cache row: only the cache slot written (same channel, same lane, after its
+                // reads) may share that memory
+                if (o < 2 && overlap(outs[o], outn[o], cg->base, (size_t) ggml_nbytes(cg->gr->src[0]))) {
+                    return why("output overlaps the conv cache");
+                }
+                continue;
+            }
             if (!overlap(outs[o], outn[o], ins[t]->data, ggml_nbytes(ins[t]))) {
                 continue;
             }
@@ -9038,7 +9174,10 @@ static bool ggml_sycl_try_conv_chain(ggml_backend_sycl_context & ctx, ggml_cgrap
     }
     float eps;
     memcpy(&eps, l2->op_params, sizeof(float));
-    const float * csd = (const float *) cs->data;
+    const float *   csd     = (const float *) cs->data;
+    const float *   cg_base = cg ? cg->base : nullptr;
+    const int32_t * cg_ids  = cg ? cg->ids : nullptr;
+    const int64_t   cg_rs   = cg ? cg->row_stride : 0;
     const char *  xd  = (const char *) x->data;
     const size_t  xnb = x->nb[1];
     const float * wd  = (const float *) w->data;
@@ -9051,8 +9190,9 @@ static bool ggml_sycl_try_conv_chain(ggml_backend_sycl_context & ctx, ggml_cgrap
         const int64_t c = it.get_global_id(0);
         const int64_t g = it.get_group(0);
         float         v[8];
+        const float * csr = cg_base ? cg_base + (int64_t) cg_ids[0] * cg_rs : csd;
         for (int t = 0; t < D - 1; ++t) {
-            v[t] = csd[c * (D - 1) + t];
+            v[t] = csr[c * (D - 1) + t];
         }
         v[D - 1] = *(const float *) (xd + c * xnb);
         float sum = 0.0f;
@@ -9244,10 +9384,19 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     std::vector<uint8_t>      done(cgraph->n_nodes, 0);
     std::vector<const void *> pending(cgraph->n_nodes, nullptr);
     ggml_sycl_xe1_stash_clear();
+    g_conv_gathers.clear();
     const bool                       ht_on   = g_ht.on && cgraph->n_nodes > 500;
     sycl_host_timing::clk::time_point ht_prev = sycl_host_timing::clk::now();
     const char *                     ht_op   = nullptr;
     const bool                       ot_on   = g_ot.on && sycl_op_timing::draft_sized(cgraph);
+    const bool                       tl_on   = g_tl.on && cgraph->n_nodes > 500 && sycl_op_timing::draft_sized(cgraph);
+    if (tl_on) {
+        if (!g_tl.dev) {
+            g_tl.dev = sycl::malloc_device<uint64_t>(sycl_timeline::MAXS, *sycl_ctx->stream());
+        }
+        g_tl.labels.clear();
+        g_tl.armed = true;
+    }
     sycl_op_timing::clk::time_point  ot_prev{};
     std::string                      ot_op;
     auto ot_mark = [&](const std::string & next) {  // drain the queue, charge the time since the last mark to the op that ran
@@ -9311,6 +9460,16 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
+        if (tl_on) {
+            const int slot = (int) g_tl.labels.size();
+            if (slot < sycl_timeline::MAXS - 1) {
+                g_tl.labels.push_back(sycl_op_timing::label(node));
+                uint64_t * ts = g_tl.dev + slot;
+                sycl_ctx->stream()->single_task([=]() {
+                    *ts = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                });
+            }
+        }
         if (ot_on) {
             ot_mark(sycl_op_timing::label(node));
         }
@@ -9356,6 +9515,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
 #endif
         if (node->op == GGML_OP_GET_ROWS && ggml_sycl_try_gdn_gather_skip(*sycl_ctx, cgraph, i)) {
+            continue;
+        }
+        if (node->op == GGML_OP_GET_ROWS && ggml_sycl_try_conv_gather_skip(*sycl_ctx, cgraph, i)) {
             continue;
         }
         // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
@@ -9554,6 +9716,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+    }
+    if (tl_on) {
+        const int slot = (int) g_tl.labels.size();
+        g_tl.labels.push_back("END");
+        uint64_t * ts = g_tl.dev + slot;
+        sycl_ctx->stream()->single_task([=]() {
+            *ts = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+        });
     }
     if (ot_on) {
         ot_mark(std::string());
@@ -9827,6 +9997,9 @@ void ggml_sycl_knobs_refresh() {
 
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    if (g_tl.on && cgraph->n_nodes > 500 && sycl_op_timing::draft_sized(cgraph)) {
+        g_tl.collect(*sycl_ctx->stream());  // stamps of the previous decode token
+    }
     g_ht.in_big = g_ht.on && cgraph->n_nodes > 500;
     if (g_ht.in_big) {
         g_ht.t_in = sycl_host_timing::clk::now();

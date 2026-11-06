@@ -724,6 +724,10 @@ static bool fwht_run(ggml_backend_sycl_context & ctx, const ggml_tensor * src, g
 
     const float scale = 1.0f / std::sqrt((float) n);
     ggml_sycl_xe1_stash_drop_range(dst->data, ggml_nbytes(dst));  // a q8 copy of an older tensor here is stale now
+    static const bool skip_rot = getenv("GGML_SYCL_SKIP_ROT") != nullptr;  // timing ablation only: output is garbage
+    if (skip_rot && rows <= 8) {
+        return true;
+    }
     // [a770-opt] decode-sized 4096-point rotations: register/sub-group kernel, plus the q8_1 copy for the mat-vecs
     static const bool r4096 = ggml_sycl_knob("GGML_SYCL_FWHT4096", ggml_sycl_device_is_alchemist(ctx.device) ? 1 : 0) != 0;
     if (r4096 && n == 4096 && src->type == GGML_TYPE_F32 && rows <= 8) {
