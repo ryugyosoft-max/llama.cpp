@@ -9484,14 +9484,44 @@ static bool ggml_sycl_try_dn_gates(ggml_backend_sycl_context & ctx, ggml_cgraph 
     // every work-group reads all of x: an output on top of an input (the planner reuses x's buffer once its last
     // reader is done) goes through a scratch buffer and one small copy kernel
     bool staged = false;
-    for (const ggml_tensor * o : { n[4], n[8] }) {
-        for (const ggml_tensor * in : { x, wa, wb, bias, sa }) {
-            staged |= overlap(o, in);
+    bool staged_ab[2] = { false, false };
+    {
+        int oi = 0;
+        for (const ggml_tensor * o : { n[4], n[8] }) {
+            for (const ggml_tensor * in : { x, wa, wb, bias, sa }) {
+                staged_ab[oi] |= overlap(o, in);
+            }
+            staged |= staged_ab[oi];
+            ++oi;
         }
     }
     ggml_sycl_pool_alloc<float> stage(ctx.pool());
     float * sa_out = nullptr;
-    if (staged) {
+    // [a770-opt] staged outputs whose only reader is the next GATED_DELTA_NET (through the gate RESHAPE): leave them in a
+    // persistent slot and point the GDN node at it, no copy kernel
+    ggml_tensor * gdn_node = nullptr;
+    if (staged && !staged_ab[0] && M == 1 && ggml_sycl_knob("GGML_SYCL_DN_GATES_OVR", 1) &&
+        2 * R * M * sizeof(float) <= PTQ1_MULTI_SLOT_BYTES) {
+        const int i5 = i + 5, i8 = i + 8;
+        if (ggml_node_get_use_count(cgraph, i + 4) == 1 && ggml_node_get_use_count(cgraph, i5) == 1 &&
+            ggml_node_get_use_count(cgraph, i8) == 1 && !(n[4]->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            !(n[8]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            for (int j = i + 9; j < cgraph->n_nodes && j <= i + 40; ++j) {
+                ggml_tensor * g = cgraph->nodes[j];
+                if (g->op == GGML_OP_GATED_DELTA_NET && g->src[3] == n[5] && g->src[4] == n[8]) {
+                    gdn_node = g;
+                    break;
+                }
+            }
+        }
+        if (gdn_node) {
+            sa_out = ggml_sycl_ptq1_multi_slot(ctx.stream());
+            if (!sa_out) {
+                gdn_node = nullptr;
+            }
+        }
+    }
+    if (staged && !gdn_node) {
         sa_out = stage.alloc((size_t) 2 * R * M);
     }
     const uint16_t * pa = (const uint16_t *) wa->data;
@@ -9499,8 +9529,9 @@ static bool ggml_sycl_try_dn_gates(ggml_backend_sycl_context & ctx, ggml_cgraph 
     const float *    px = (const float *) x->data;
     const float *    pbias = (const float *) bias->data;
     const float *    psa   = (const float *) sa->data;
-    float *          oa    = staged ? sa_out : (float *) n[4]->data;
-    float *          ob    = staged ? sa_out + R * M : (float *) n[8]->data;
+    // with the GDN override only the outputs that overlap an input go to the slot (the other is written in place)
+    float *          oa    = staged && (!gdn_node || staged_ab[0]) ? sa_out : (float *) n[4]->data;
+    float *          ob    = staged && (!gdn_node || staged_ab[1]) ? sa_out + R * M : (float *) n[8]->data;
     const int        Ki = (int) K, Ri = (int) R, Mi = (int) M;
     constexpr int    WG = 256;
     if (Mi == 1 && wf32 && Ki == 4096) {
@@ -9589,7 +9620,10 @@ static bool ggml_sycl_try_dn_gates(ggml_backend_sycl_context & ctx, ggml_cgraph 
             }
         }
     });
-    if (staged) {
+    if (gdn_node) {
+        // only the staged output is redirected (overriding the gate too changed the results: keep it in place)
+        ggml_sycl_gdn_gate_override(ctx, gdn_node, staged_ab[0] ? sa_out : nullptr, staged_ab[1] ? sa_out + R * M : nullptr);
+    } else if (staged) {
         float * da = (float *) n[4]->data, * db = (float *) n[8]->data;
         const float * so = sa_out;
         const size_t  RM = (size_t) R * M;
@@ -9797,6 +9831,38 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         if (node->op == GGML_OP_CONCAT && ggml_sycl_try_conv_chain(*sycl_ctx, cgraph, i, done)) {
             continue;
+        }
+        // [a770-opt] attention output gate: CONT(gate view) -> SIGMOID -> MUL(attn, .) -> MUL(signs) -> RESHAPE ->
+        // MUL_MAT(Hadamard 4096) as one rotation kernel with the gating in its load
+        if (node->op == GGML_OP_CONT && i + 5 < cgraph->n_nodes) {
+            ggml_tensor * ct = node;
+            ggml_tensor * sg = cgraph->nodes[i + 1];
+            ggml_tensor * gm = cgraph->nodes[i + 2];
+            ggml_tensor * ms = cgraph->nodes[i + 3];
+            ggml_tensor * rs = cgraph->nodes[i + 4];
+            ggml_tensor * mt = cgraph->nodes[i + 5];
+            const ggml_tensor * v = ct->src[0];
+            if (sg->op == GGML_OP_UNARY && ggml_get_unary_op(sg) == GGML_UNARY_OP_SIGMOID && sg->src[0] == ct &&
+                gm->op == GGML_OP_MUL && (gm->src[0] == sg || gm->src[1] == sg) && ms->op == GGML_OP_MUL &&
+                ms->src[0] == gm && rs->op == GGML_OP_RESHAPE && rs->src[0] == ms && mt->op == GGML_OP_MUL_MAT &&
+                mt->src[1] == rs && ggml_get_op_params_i32(mt, 1) == GGML_HINT_SRC0_IS_HADAMARD && mt->src[0]->ne[0] == 4096 &&
+                ggml_nelements(ct) == 4096 && ct->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32 &&
+                v->nb[0] == sizeof(float) && v->ne[2] == 1 && v->ne[3] == 1 && v->nb[1] % sizeof(float) == 0 &&
+                ggml_is_contiguous(mt) && mt->type == GGML_TYPE_F32) {
+                const ggml_tensor * a     = gm->src[0] == sg ? gm->src[1] : gm->src[0];
+                const ggml_tensor * signs = ms->src[1];
+                const int idx[6] = { i, i + 1, i + 2, i + 3, i + 4, i + 5 };
+                const ggml_op ops[6] = { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+                const int out[1] = { i + 5 };
+                if (a->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && ggml_nelements(a) == 4096 && signs &&
+                    signs->type == GGML_TYPE_F32 && ggml_is_contiguous(signs) && ggml_nelements(signs) == 4096 &&
+                    ggml_can_fuse_subgraph_ext(cgraph, idx, 6, ops, out, 1) &&
+                    ggml_sycl_fwht4096_gated(*sycl_ctx, (const float *) a->data, (const float *) v->data,
+                                             (int) (v->nb[1] / sizeof(float)), (int) v->ne[0], (const float *) signs->data, mt)) {
+                    i += 5;
+                    continue;
+                }
+            }
         }
         // ARC-LAB: [residual ADD +] RMS_NORM + MUL(weight) [+ MUL(signs) + RESHAPE + FWHT-hint MUL_MAT] in one kernel
         // (ggml_sycl_t2_add_norm_rot): the post-attention norm of every layer and the pre-attention norm of the full

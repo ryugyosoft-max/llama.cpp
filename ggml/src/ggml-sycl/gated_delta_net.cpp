@@ -1107,8 +1107,22 @@ struct ggml_sycl_gdn_gather {
 };
 static std::unordered_map<const ggml_backend_sycl_context *, std::unordered_map<const ggml_tensor *, ggml_sycl_gdn_gather>> g_gdn_gathers;
 
+// [a770-opt] g / beta inputs read from where the fused DeltaNet gate kernel left them (instead of a copy back), keyed
+// by the GDN node; reset with the gathers
+struct ggml_sycl_gdn_gate_ovr {
+    const float * g;
+    const float * b;
+};
+static std::unordered_map<const ggml_backend_sycl_context *, std::unordered_map<const ggml_tensor *, ggml_sycl_gdn_gate_ovr>> g_gdn_gate_ovr;
+
+void ggml_sycl_gdn_gate_override(const ggml_backend_sycl_context & ctx, const ggml_tensor * gdn, const float * g,
+                                 const float * b) {
+    g_gdn_gate_ovr[&ctx][gdn] = { g, b };
+}
+
 void ggml_sycl_gdn_gather_reset(const ggml_backend_sycl_context & ctx) {
     g_gdn_gathers[&ctx].clear();
+    g_gdn_gate_ovr[&ctx].clear();
 }
 
 void ggml_sycl_gdn_gather_set(const ggml_backend_sycl_context & ctx, const ggml_tensor * gdn, const float * base,
@@ -1155,6 +1169,14 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
     float *         dst_d        = (float *) dst->data;
     const int32_t * s_ids        = nullptr;
     int64_t         s_row_stride = 0;
+    {
+        auto & mo = g_gdn_gate_ovr[&ctx];
+        auto   io = mo.find(dst);
+        if (io != mo.end()) {
+            g_d = io->second.g ? io->second.g : g_d;
+            b_d = io->second.b ? io->second.b : b_d;
+        }
+    }
     {
         auto & m  = g_gdn_gathers[&ctx];
         auto   it = m.find(dst);

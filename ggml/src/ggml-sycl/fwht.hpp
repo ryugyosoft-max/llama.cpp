@@ -22,3 +22,7 @@ bool ggml_sycl_op_fwht_signed(ggml_backend_sycl_context & ctx, const ggml_tensor
 // add_out / normed may be null (not needed after). False = not taken.
 bool ggml_sycl_fwht4096_add_norm_rot(ggml_backend_sycl_context & ctx, const float * a, const float * b, float * add_out,
                                      const float * w, float eps, float * normed, const float * signs, ggml_tensor * mm);
+
+// [a770-opt] a * sigmoid(gate view) + sign flip + 4096-point rotation in one kernel (attention output gate); false = not taken
+bool ggml_sycl_fwht4096_gated(ggml_backend_sycl_context & ctx, const float * a, const float * gbase, int gstride, int D,
+                              const float * signs, ggml_tensor * mm);

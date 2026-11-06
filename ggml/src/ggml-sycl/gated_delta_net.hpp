@@ -20,6 +20,9 @@ void ggml_sycl_op_gated_delta_net_fused_cache(ggml_backend_sycl_context & ctx, g
 
 // fused recurrent-state gather (see ggml_sycl_try_gdn_gather_skip): reset per graph, set per GDN node
 void ggml_sycl_gdn_gather_reset(const ggml_backend_sycl_context & ctx);
+// [a770-opt] the GDN node reads g / beta from these pointers (the fused gate kernel's slot) instead of its sources
+void ggml_sycl_gdn_gate_override(const ggml_backend_sycl_context & ctx, const ggml_tensor * gdn, const float * g,
+                                 const float * b);
 void ggml_sycl_gdn_gather_set(const ggml_backend_sycl_context & ctx, const ggml_tensor * gdn, const float * base,
                               const int32_t * ids, int64_t row_stride);
 

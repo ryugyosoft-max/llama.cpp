@@ -948,6 +948,42 @@ bool ggml_sycl_fwht4096_add_norm_rot(ggml_backend_sycl_context & ctx, const floa
     return true;
 }
 
+// [a770-opt] attention output gate in the rotation's load: x = a * sigmoid(gate) with the gate read straight from its
+// strided view (row h of D values at gbase + h * gstride), then signs + 4096-point rotation (1024-wide kernel)
+bool ggml_sycl_fwht4096_gated(ggml_backend_sycl_context & ctx, const float * a, const float * gbase, int gstride, int D,
+                              const float * signs, ggml_tensor * mm) {
+    if (!ggml_sycl_knob("GGML_SYCL_FWHT4096", ggml_sycl_device_is_alchemist(ctx.device) ? 1 : 0) ||
+        !ggml_sycl_knob("GGML_SYCL_FWHT1024", 1) || !ggml_sycl_knob("GGML_SYCL_FWHT_GATE", 1) ||
+        mm->type != GGML_TYPE_F32 || ggml_nelements(mm) != 4096 || D <= 0 || (D & (D - 1)) != 0 || 4096 % D != 0) {
+        return false;
+    }
+    ggml_sycl_xe1_stash_drop_range(mm->data, ggml_nbytes(mm));
+    int dl = 0;
+    while ((1 << dl) < D) ++dl;
+    const int dmask = D - 1;
+    float *   dst   = (float *) mm->data;
+    ctx.stream()->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> sl(sycl::range<1>(4096 + 256), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(1024, 1024), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const int t = (int) it.get_local_id(0);
+            float     v[4];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const int   i = k * 1024 + t;
+                const float g = gbase[(i >> dl) * gstride + (i & dmask)];
+                v[k]          = a[i] / (1.0f + sycl::exp(-g)) * signs[i] * (1.0f / 64.0f);
+            }
+            fwht4096_wg1024(v, sl.get_multi_ptr<sycl::access::decorated::no>().get(), it);
+            const int lane = it.get_sub_group().get_local_linear_id(), lo4 = (t >> 4) & 15, hi2 = t >> 8;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                dst[lo4 | (lane << 4) | (k << 8) | (hi2 << 10)] = v[k];
+            }
+        });
+    });
+    return true;
+}
+
 bool ggml_sycl_op_fwht_signed(ggml_backend_sycl_context & ctx, const ggml_tensor * src, const ggml_tensor * signs,
                               ggml_tensor * dst) {
     return fwht_signed_impl::fwht_run(ctx, src, dst, signs);
