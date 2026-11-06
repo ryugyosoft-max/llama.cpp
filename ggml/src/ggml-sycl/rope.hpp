@@ -20,6 +20,9 @@ void ggml_sycl_rope(ggml_backend_sycl_context & ctx, ggml_tensor *dst);
 void ggml_sycl_rope_back(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
 void ggml_sycl_rope_fused(ggml_backend_sycl_context & ctx, ggml_tensor * dst, ggml_tensor * set_rows);
+// [a770-opt] RMS_NORM * w -> M-RoPE [-> f16 cache row] for one token; false = not taken
+bool ggml_sycl_norm_rope_fused(ggml_backend_sycl_context & ctx, const ggml_tensor * norm, const ggml_tensor * mul,
+                               ggml_tensor * rope, ggml_tensor * set_rows);
 
 // [a770-opt] ROPE(Q) + ROPE(K) -> K cache + V -> V cache in one launch; false if the shapes are not handled
 bool ggml_sycl_rope_qkv_cache(ggml_backend_sycl_context & ctx, ggml_tensor * rope_q, ggml_tensor * rope_k,

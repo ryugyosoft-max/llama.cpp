@@ -9885,6 +9885,33 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (node->op == GGML_OP_RMS_NORM && ggml_sycl_try_dn_out_chain(*sycl_ctx, cgraph, i)) {
             continue;
         }
+        // [a770-opt] attention q / k: RMS_NORM -> MUL(w) -> ROPE [-> VIEW -> SET_ROWS f16 cache] in one kernel
+        if (node->op == GGML_OP_RMS_NORM && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL &&
+            cgraph->nodes[i + 2]->op == GGML_OP_ROPE && ggml_sycl_knob("GGML_SYCL_NORM_ROPE", 1) &&
+            cgraph->nodes[i + 1]->src[0] == node && cgraph->nodes[i + 2]->src[0] == cgraph->nodes[i + 1] &&
+            ggml_nrows(cgraph->nodes[i + 1]->src[1]) == 1) {
+            ggml_tensor * sr  = nullptr;
+            int           end = i + 2;
+            if (i + 4 < cgraph->n_nodes && cgraph->nodes[i + 3]->op == GGML_OP_VIEW &&
+                cgraph->nodes[i + 3]->src[0] == cgraph->nodes[i + 2] && cgraph->nodes[i + 4]->op == GGML_OP_SET_ROWS &&
+                cgraph->nodes[i + 4]->src[0] == cgraph->nodes[i + 3] && cgraph->nodes[i + 3]->view_offs == 0 &&
+                ggml_is_contiguous(cgraph->nodes[i + 3])) {
+                sr  = cgraph->nodes[i + 4];
+                end = i + 4;
+            }
+            std::vector<int>     idx;
+            std::vector<ggml_op> ops;
+            for (int j = i; j <= end; ++j) {
+                idx.push_back(j);
+                ops.push_back(cgraph->nodes[j]->op);
+            }
+            const int out_node = sr ? end : i + 2;
+            if (ggml_can_fuse_subgraph_ext(cgraph, idx.data(), (int) idx.size(), ops.data(), &out_node, 1) &&
+                ggml_sycl_norm_rope_fused(*sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], sr)) {
+                i = end;
+                continue;
+            }
+        }
         if (node->op == GGML_OP_RMS_NORM && !g_staged_redirect.empty()) {
             for (int k = 0; k < GGML_MAX_SRC && node->src[k]; ++k) {
                 ggml_sycl_staged_flush(*sycl_ctx, node->src[k]);

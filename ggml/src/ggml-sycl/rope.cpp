@@ -545,6 +545,14 @@ void ggml_sycl_op_rope_impl(ggml_backend_sycl_context &ctx, ggml_tensor *dst,
         freq_factors = (const float *)src2->data;
     }
 
+    if (getenv("GGML_SYCL_ROPE_LOG")) {
+        static int nlog = 0;
+        if (nlog++ < 4) {
+            fprintf(stderr, "rope %s: ne %lld %lld %lld mode %d n_dims %d n_offs %d sections %d %d %d %d ff %d ext %.3f fs %.3f s01 %zu s1 %zu\n",
+                    dst->name, (long long) ne00, (long long) ne01, (long long) ne02, mode, n_dims, n_offs, sections.v[0],
+                    sections.v[1], sections.v[2], sections.v[3], src2 != nullptr, ext_factor, freq_scale, s01, s1);
+        }
+    }
     rope_corr_dims corr_dims;
     ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast,
                              beta_slow, corr_dims.v);
@@ -777,5 +785,103 @@ bool ggml_sycl_rope_qkv_cache(ggml_backend_sycl_context & ctx, ggml_tensor * rq,
     } else {
         stream->parallel_for(sycl::nd_range<1>(n, wg), [=](sycl::nd_item<1> it) { rope_qkv_kernel<float>(p, it); });
     }
+    return true;
+}
+
+// [a770-opt] decode attention q / k: RMS_NORM(rows of D) * w -> M-RoPE / IM-RoPE (n_offs 0, no freq factors, no YaRN
+// extension) [-> f16 KV-cache row via SET_ROWS] in one kernel: one work-group per head, the rotation partners through
+// SLM. Same theta / sector / rope_yarn math as rope_multi. 2-3 launches -> 1 per q and per k.
+bool ggml_sycl_norm_rope_fused(ggml_backend_sycl_context & ctx, const ggml_tensor * norm, const ggml_tensor * mul,
+                               ggml_tensor * rope, ggml_tensor * set_rows) {
+    const ggml_tensor * x   = norm->src[0];
+    const ggml_tensor * w   = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    const ggml_tensor * pos = rope->src[1];
+    const int64_t       D = x->ne[0], NH = x->ne[1];
+    const int n_dims = ((const int32_t *) rope->op_params)[1];
+    const int mode   = ((const int32_t *) rope->op_params)[2];
+    const int n_offs = ((const int32_t *) rope->op_params)[15];
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    memcpy(&freq_base, (const int32_t *) rope->op_params + 5, sizeof(float));
+    memcpy(&freq_scale, (const int32_t *) rope->op_params + 6, sizeof(float));
+    memcpy(&ext_factor, (const int32_t *) rope->op_params + 7, sizeof(float));
+    memcpy(&attn_factor, (const int32_t *) rope->op_params + 8, sizeof(float));
+    memcpy(&beta_fast, (const int32_t *) rope->op_params + 9, sizeof(float));
+    memcpy(&beta_slow, (const int32_t *) rope->op_params + 10, sizeof(float));
+    mrope_sections sections;
+    memcpy(&sections.v, (const int32_t *) rope->op_params + 11, sizeof(int) * 4);
+    const bool is_mrope  = mode & GGML_ROPE_TYPE_MROPE;
+    const bool is_imrope = mode == GGML_ROPE_TYPE_IMROPE;
+    if (!is_mrope || mode == GGML_ROPE_TYPE_VISION || n_offs != 0 || rope->src[2] != nullptr || ext_factor != 0.0f ||
+        x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || rope->type != GGML_TYPE_F32 || x->ne[2] != 1 ||
+        x->ne[3] != 1 || x->nb[0] != sizeof(float) || x->nb[1] % sizeof(float) != 0 || !ggml_is_contiguous(w) ||
+        ggml_nelements(w) != D || D % 16 != 0 || D > 1024 || n_dims <= 0 || n_dims > D || n_dims % 2 != 0 ||
+        !ggml_is_contiguous(rope) || rope->ne[0] != D || rope->ne[1] != NH || pos->type != GGML_TYPE_I32 ||
+        sections.v[0] + sections.v[1] + sections.v[2] + sections.v[3] <= 0) {
+        return false;
+    }
+    sycl::half *    cache    = nullptr;
+    const int64_t * row_idx  = nullptr;
+    int64_t         c_stride = 0;
+    if (set_rows) {
+        if (set_rows->type != GGML_TYPE_F16 || set_rows->src[1]->type != GGML_TYPE_I64 || ggml_nelements(set_rows->src[1]) != 1 ||
+            set_rows->nb[0] != sizeof(sycl::half) || ggml_nelements(set_rows->src[0]) != D * NH) {
+            return false;
+        }
+        cache    = (sycl::half *) set_rows->data;
+        row_idx  = (const int64_t *) set_rows->src[1]->data;
+        c_stride = (int64_t) (set_rows->nb[1] / sizeof(sycl::half));
+    }
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    rope_corr_dims corr_dims;
+    ggml_rope_yarn_corr_dims(n_dims, ((const int32_t *) rope->op_params)[4], freq_base, beta_fast, beta_slow, corr_dims.v);
+    const float     theta_scale = powf(freq_base, -2.0f / n_dims);
+    const float *   xd  = (const float *) x->data;
+    const int       xs1 = (int) (x->nb[1] / sizeof(float));
+    const float *   wd  = (const float *) w->data;
+    const int32_t * pd  = (const int32_t *) pos->data;
+    const int64_t   np  = rope->src[0]->ne[2];  // tokens (1): position stream k at pd[k * np], as rope_multi's ne02
+    float *         dd  = (float *) rope->data;
+    const int       Di  = (int) D;
+    ctx.stream()->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> sl(sycl::range<1>(D), cgh);
+        cgh.parallel_for(sycl::nd_range<1>((size_t) (NH * D), (size_t) D), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const int   h  = (int) it.get_group(0), j = (int) it.get_local_id(0);
+            const float v  = xd[h * xs1 + j];
+            const float ss = sycl::reduce_over_group(it.get_group(), v * v, sycl::plus<float>());
+            const float y  = v * sycl::rsqrt(ss / Di + eps) * wd[j];
+            sl[j]          = y;
+            it.barrier(sycl::access::fence_space::local_space);
+            float out = y;
+            if (j < n_dims) {
+                const int half = n_dims / 2;
+                const int p    = j < half ? j : j - half;
+                const int iw   = 2 * p;
+                const int sect_dims = sections.v[0] + sections.v[1] + sections.v[2] + sections.v[3];
+                const int sec_w     = sections.v[1] + sections.v[0];
+                const int sector    = p % sect_dims;
+                int       ps        = 3;
+                if (is_imrope) {
+                    if (sector % 3 == 1 && sector < 3 * sections.v[1]) ps = 1;
+                    else if (sector % 3 == 2 && sector < 3 * sections.v[2]) ps = 2;
+                    else if (sector % 3 == 0 && sector < 3 * sections.v[0]) ps = 0;
+                } else {
+                    if (sector < sections.v[0]) ps = 0;
+                    else if (sector < sec_w) ps = 1;
+                    else if (sector < sec_w + sections.v[2]) ps = 2;
+                }
+                const float theta_base = pd[ps * np] * dpct::pow(theta_scale, iw / 2.0f);
+                float       cos_theta, sin_theta;
+                rope_yarn<true>(theta_base, freq_scale, corr_dims, iw, ext_factor, attn_factor, cos_theta, sin_theta);
+                const float x0 = sl[p], x1 = sl[p + half];
+                out = j < half ? x0 * cos_theta - x1 * sin_theta : x0 * sin_theta + x1 * cos_theta;
+            }
+            if (cache) {
+                cache[row_idx[0] * c_stride + h * Di + j] = sycl::half(out);
+            } else {
+                dd[h * Di + j] = out;
+            }
+        });
+    });
     return true;
 }
