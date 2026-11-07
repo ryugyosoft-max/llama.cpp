@@ -316,6 +316,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_lfm2(params);
         case LLM_ARCH_LFM2MOE:
             return new llama_model_lfm2moe(params);
+        case LLM_ARCH_LFM3:
+            return new llama_model_lfm3(params);
         case LLM_ARCH_SMALLTHINKER:
             return new llama_model_smallthinker(params);
         case LLM_ARCH_GROVEMOE:
@@ -587,7 +589,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
         }
         if (std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_s_cache)) {
-            if (ud->model->arch == LLM_ARCH_LFM2 || ud->model->arch == LLM_ARCH_LFM2MOE) {
+            if (ud->model->arch == LLM_ARCH_LFM2 || ud->model->arch == LLM_ARCH_LFM2MOE || ud->model->arch == LLM_ARCH_LFM3) {
                 // the LFM2 shortconv block runs fully mirrored, so its conv state must be mirrored too
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED, "");
             }
@@ -3657,6 +3659,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_HY_V3:
         case LLM_ARCH_LFM2:
         case LLM_ARCH_LFM2MOE:
+        case LLM_ARCH_LFM3:
         case LLM_ARCH_SMALLTHINKER:
         case LLM_ARCH_SEED_OSS:
         case LLM_ARCH_GROVEMOE:
