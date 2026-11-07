@@ -86,7 +86,11 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
                          arch == gpu_arch::intel_gpu_dg2_g11 ||
                          arch == gpu_arch::intel_gpu_dg2_g12);
 
-    if (!support_spda && K->ne[0] == 64) {
+    // [a770-opt] head size 64 passes on the A770 with oneDNN 2026.2 (test-backend-ops hsk=64 1816/1816; LFM2.5 24B-A2B
+    // 16K-context PPL 2.4412 MKL path vs 2.4397 SDPA) and is 2.1x faster at a 32K cache: on by default,
+    // GGML_SYCL_FA_ONEDNN_D64=0 restores the gate
+    static const bool d64_force = !getenv("GGML_SYCL_FA_ONEDNN_D64") || atoi(getenv("GGML_SYCL_FA_ONEDNN_D64")) != 0;
+    if (!support_spda && K->ne[0] == 64 && !d64_force) {
         return false;
     }
     // Optional KV-length ceiling (GGML_SYCL_FA_ONEDNN_MAX_KV, 0 = unlimited). Escape hatch:
