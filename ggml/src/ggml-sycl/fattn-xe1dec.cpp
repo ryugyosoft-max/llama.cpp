@@ -576,7 +576,7 @@ static void launch_gqa(int gqa, const xe1dec_params & p, int nkvh, int ne3, int 
 
 static int xe1dec_ds(int D) {
     static const int ds256 = getenv("GGML_SYCL_XE1DEC_DS256") ? atoi(getenv("GGML_SYCL_XE1DEC_DS256")) : 4;
-    return D == 256 ? (ds256 == 2 ? 2 : 4) : 2;
+    return D == 256 ? (ds256 == 2 ? 2 : 4) : D == 64 ? 1 : 2;  // [a770-opt] D 64: LFM2 / LFM2.5
 }
 
 static int xe1dec_r(int D, int gqa) {
@@ -614,7 +614,7 @@ static bool xe1dec_supported_impl(int device, const ggml_tensor * dst, int & why
     static const int xmx_min = getenv("GGML_SYCL_XE1X_MIN_KV") ? atoi(getenv("GGML_SYCL_XE1X_MIN_KV")) : 2048;
     const int max_q = kv_quant && xmx_min > 0 && K->ne[1] >= xmx_min && Q->ne[2] / K->ne[2] <= 8 && Q->ne[3] == 1 ? 16 : 4;
     if (Q->ne[1] < 1 || Q->ne[1] > max_q || Q->type != GGML_TYPE_F32 || !(kv_f16 || kv_quant) ||
-        dst->type != GGML_TYPE_F32 || V->ne[0] != D || (D != 128 && D != 256) || K->ne[1] < min_kv ||
+        dst->type != GGML_TYPE_F32 || V->ne[0] != D || (D != 64 && D != 128 && D != 256) || K->ne[1] < min_kv ||
         max_bias != 0.0f || softcap != 0.0f || (sinks && sinks->type != GGML_TYPE_F32)) {
         return (why = 3, false);
     }
@@ -931,7 +931,7 @@ void ggml_sycl_flash_attn_ext_xe1dec(ggml_backend_sycl_context & ctx, ggml_tenso
     static const int env_wg    = getenv("GGML_SYCL_XE1DEC_WG") ? atoi(getenv("GGML_SYCL_XE1DEC_WG")) : 0;
     const int        target_wg = env_wg > 0 ? env_wg : (K->ne[2] >= 16 ? 64 : 256);
     const bool kv_q   = K->type != GGML_TYPE_F16;  // quantized kernels always use DS 4 (D 256) / 2 (D 128)
-    const int R       = kv_q ? std::max(1, 16 / (gqa * (D == 256 ? 4 : 2))) : xe1dec_r(D, gqa);
+    const int R       = kv_q ? std::max(1, 16 / (gqa * (D == 256 ? 4 : D == 64 ? 1 : 2))) : xe1dec_r(D, gqa);
     const int want    = std::max(2, (target_wg + nkvh * ne3 - 1) / (nkvh * ne3));
     const int nsplit  = std::min(512 / R, want);
     int split_kv      = (KV + nsplit - 1) / nsplit;
@@ -972,16 +972,20 @@ void ggml_sycl_flash_attn_ext_xe1dec(ggml_backend_sycl_context & ctx, ggml_tenso
     } else if (use_xmx) {
         if (K->type == GGML_TYPE_Q4_0) {
             D == 256 ? xe1x::launch<256, GGML_TYPE_Q4_0>(p, gqa, nkvh, k_num, stream)
+            : D == 64 ? xe1x::launch<64, GGML_TYPE_Q4_0>(p, gqa, nkvh, k_num, stream)
                      : xe1x::launch<128, GGML_TYPE_Q4_0>(p, gqa, nkvh, k_num, stream);
         } else {
             D == 256 ? xe1x::launch<256, GGML_TYPE_Q8_0>(p, gqa, nkvh, k_num, stream)
+            : D == 64 ? xe1x::launch<64, GGML_TYPE_Q8_0>(p, gqa, nkvh, k_num, stream)
                      : xe1x::launch<128, GGML_TYPE_Q8_0>(p, gqa, nkvh, k_num, stream);
         }
     } else if (K->type == GGML_TYPE_Q8_0) {
         if (D == 256) { launch_gqa_q<256, 4, GGML_TYPE_Q8_0>(gqa, p, nkvh, ne3, wgs, stream); }
+        else if (D == 64) { launch_gqa_q<64, 1, GGML_TYPE_Q8_0>(gqa, p, nkvh, ne3, wgs, stream); }
         else          { launch_gqa_q<128, 2, GGML_TYPE_Q8_0>(gqa, p, nkvh, ne3, wgs, stream); }
     } else if (K->type == GGML_TYPE_Q4_0) {
         if (D == 256) { launch_gqa_q<256, 4, GGML_TYPE_Q4_0>(gqa, p, nkvh, ne3, wgs, stream); }
+        else if (D == 64) { launch_gqa_q<64, 1, GGML_TYPE_Q4_0>(gqa, p, nkvh, ne3, wgs, stream); }
         else          { launch_gqa_q<128, 2, GGML_TYPE_Q4_0>(gqa, p, nkvh, ne3, wgs, stream); }
     } else if (D == 256) {
         if (xe1dec_ds(256) == 2) {
@@ -989,6 +993,8 @@ void ggml_sycl_flash_attn_ext_xe1dec(ggml_backend_sycl_context & ctx, ggml_tenso
         } else {
             launch_gqa<256, 4>(gqa, p, nkvh, ne3, wgs, stream);
         }
+    } else if (D == 64) {
+        launch_gqa<64, 1>(gqa, p, nkvh, ne3, wgs, stream);
     } else {
         launch_gqa<128, 2>(gqa, p, nkvh, ne3, wgs, stream);
     }
