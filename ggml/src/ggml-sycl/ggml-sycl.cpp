@@ -7022,8 +7022,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     std::vector<char> ids_host(ggml_nbytes(ids));
     const char * ids_dev = (const char *) ids->data;
 
+    // [a770-opt] drain the queue, then wait on the copy's own event: with UR_L0_USE_DRIVER_INORDER_LISTS=1 (our
+    // Alchemist default) the copy alone could read the router's ids before the kernels writing them had finished
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
     SYCL_CHECK(CHECK_TRY_ERROR(
-        stream->memcpy(ids_host.data(), ids_dev, ggml_nbytes(ids))));
+        stream->memcpy(ids_host.data(), ids_dev, ggml_nbytes(ids)).wait()));
 
     // also ensures ctx.mmid_row_mapping_host and ctx.mmid_tile_schedule_host are drained before we
     // refill them: the grouped GEMM enqueues an async copy out of the tile schedule, so removing
