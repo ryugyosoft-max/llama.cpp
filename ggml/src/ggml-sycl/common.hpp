@@ -94,8 +94,10 @@ enum ggml_sycl_xmx_gather_type {
     GGML_SYCL_XMX_GATHER_Q4_K     = 1 << 10,
     GGML_SYCL_XMX_GATHER_Q5_K     = 1 << 11,
     GGML_SYCL_XMX_GATHER_Q6_K     = 1 << 12,
+    GGML_SYCL_XMX_GATHER_Q4_0     = 1 << 13,  // [a770-opt] MoE prompt GEMM (LFM2.5 QAD-Q4_0)
 };
-static constexpr int GGML_SYCL_XMX_GATHER_TYPES_DEFAULT = ~0;
+// [a770-opt] Q4_0 off by default: on the A770 the grouped GEMM halves the LFM2.5 24B-A2B prompt rate (1086 -> 515)
+static constexpr int GGML_SYCL_XMX_GATHER_TYPES_DEFAULT = ~GGML_SYCL_XMX_GATHER_Q4_0;
 extern int g_ggml_sycl_xmx_gather_types;
 // Which joint_matrix combinations the XMX dequant-GEMM paths may use, one bit each (see fused-gemm.cpp).
 // GGML_SYCL_DYNAMIC_PRECISION picks the operand type, this mask the combinations of that type.

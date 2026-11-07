@@ -378,6 +378,38 @@ bool ggml_sycl_q4_0_xe1_mul_mat_vec_multi(const void * const * vx, float * const
     return true;
 }
 
+void ggml_sycl_q4_0_xe1_mul_mat_vec_id(const void * vx_base, const void * vy, const int32_t * ids, float * dst_base,
+                                       int ncols, int nrows, int n_used, size_t expert_stride, size_t dst_row_stride,
+                                       size_t src1_row_stride, dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK4_0 == 0);
+    const int SGS = q4_0_xe1_sgs();
+    const int nwg = (nrows + SGS - 1) / SGS;
+    const uint32_t es = (uint32_t) expert_stride, ds = (uint32_t) dst_row_stride, ys = (uint32_t) src1_row_stride;
+    GGML_ASSERT(expert_stride <= UINT32_MAX);
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) n_used, (size_t) nwg * SGS * WARP_SIZE),
+                                           sycl::range<2>(1, SGS * WARP_SIZE)),
+                         [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             const auto sg   = it.get_sub_group();
+                             const int  e    = (int) it.get_group(0);
+                             const int  row0 = (int) it.get_group(1) * SGS + (int) sg.get_group_linear_id();
+                             if (row0 >= nrows) {
+                                 return;
+                             }
+                             float * dst = (float *) ((char *) dst_base + (uint32_t) e * ds);
+                             const int i02 = ids[e];
+                             if (i02 < 0) {
+                                 if (sg.leader()) {
+                                     dst[row0] = 0.0f;
+                                 }
+                                 return;
+                             }
+                             q4_0_xe1_rows<1, 1>((const uint8_t *) vx_base + (uint32_t) i02 * es,
+                                                 (const int8_t *) vy + (uint32_t) e * ys, dst, ncols, nrows, row0, sg);
+                         });
+    });
+}
+
 void ggml_sycl_q4_0_xe1_swiglu(const void * wg, const void * wu, const void * vy, float * dst, int ncols, int nrows,
                                dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK4_0 == 0);

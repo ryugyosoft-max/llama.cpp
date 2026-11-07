@@ -411,6 +411,7 @@ template <> struct fg_block_traits<block_iq2_s>   { static constexpr int qk = QK
 template <> struct fg_block_traits<block_iq1_s>   { static constexpr int qk = QK_K; };
 template <> struct fg_block_traits<block_iq1_m>   { static constexpr int qk = QK_K; };
 template <> struct fg_block_traits<block_q8_0>    { static constexpr int qk = QK8_0; };
+template <> struct fg_block_traits<block_q4_0>    { static constexpr int qk = QK4_0; };
 template <> struct fg_block_traits<block_q4_K>    { static constexpr int qk = QK_K; };
 template <> struct fg_block_traits<block_q5_K>    { static constexpr int qk = QK_K; };
 template <> struct fg_block_traits<block_q6_K>    { static constexpr int qk = QK_K; };
@@ -584,6 +585,16 @@ static __dpct_inline__ void fg_decode_q8_0(const int8_t * __restrict__ qs, const
     }
 }
 
+// [a770-opt] Q4_0: byte j holds value j (low nibble) and value j + 16 (high nibble), minus 8
+template <typename E>
+static __dpct_inline__ void fg_decode_q4_0(const uint8_t * __restrict__ qs, const float d, typename E::pair * a) {
+#pragma unroll
+    for (int j = 0; j < QK4_0 / 4; ++j) {
+        a[j] = E::make(d * ((qs[2 * j] & 0xF) - 8), d * ((qs[2 * j + 1] & 0xF) - 8));
+        a[j + QK4_0 / 4] = E::make(d * ((qs[2 * j] >> 4) - 8), d * ((qs[2 * j + 1] >> 4) - 8));
+    }
+}
+
 // same unpack as get_scale_min_k4() in dequantize.hpp
 static __dpct_inline__ void fg_scale_min_k4(const int j, const uint8_t * __restrict__ q, uint8_t & d, uint8_t & m) {
     if (j < 4) {
@@ -659,6 +670,11 @@ static __dpct_inline__ void fg_stage_a(const block_q8_0 * __restrict__ xrow, con
 }
 
 template <typename E>
+static __dpct_inline__ void fg_stage_a(const block_q4_0 * __restrict__ xrow, const int kb, typename E::pair * a) {
+    fg_decode_q4_0<E>(xrow[kb].qs, (float) xrow[kb].d, a);
+}
+
+template <typename E>
 static __dpct_inline__ void fg_stage_a(const block_q4_K * __restrict__ xrow, const int kb, typename E::pair * a) {
     FG_SUPERBLOCK(block_q4_K);
     fg_decode_q4_K<E>(blk->qs, blk->scales, blk->dm, ib, a);
@@ -690,6 +706,17 @@ template <> struct fg_soa<block_q8_0> {
                                       typename E::pair * a) {
         const float d = (float) ((const sycl::half *) (x + nblocks * QK8_0))[ib];
         fg_decode_q8_0<E>((const int8_t *) x + ib * QK8_0, d, a);
+    }
+};
+
+template <> struct fg_soa<block_q4_0> {
+    static constexpr bool supported = true;
+    // [qs 16 B per block][d]
+    template <typename E>
+    static __dpct_inline__ void stage(const uint8_t * x, const size_t nblocks, const size_t ib, const int,
+                                      typename E::pair * a) {
+        const float d = (float) ((const sycl::half *) (x + nblocks * (QK4_0 / 2)))[ib];
+        fg_decode_q4_0<E>(x + ib * (QK4_0 / 2), d, a);
     }
 };
 
@@ -932,7 +959,7 @@ static void grouped_gemm_pack_b(const float * y, typename S::tsb * packed, const
 // q8_0 and the k-quants take only the grouped path. The plain kernel decodes A again for every BN columns
 // of a dense batch, and for these formats that costs more than the one dequantization of the library GEMM.
 template <typename T> static constexpr bool fg_plain_ok() {
-    return !std::is_same_v<T, block_q8_0> && !std::is_same_v<T, block_q4_K> && !std::is_same_v<T, block_q5_K> &&
+    return !std::is_same_v<T, block_q8_0> && !std::is_same_v<T, block_q4_0> && !std::is_same_v<T, block_q4_K> && !std::is_same_v<T, block_q5_K> &&
            !std::is_same_v<T, block_q6_K>;
 }
 
@@ -966,6 +993,7 @@ template <typename F> static bool fg_visit_type(ggml_type type, bool reordered, 
         case GGML_TYPE_IQ1_S:   return fg_visit_layout<block_iq1_s>(reordered, f);
         case GGML_TYPE_IQ1_M:   return fg_visit_layout<block_iq1_m>(reordered, f);
         case GGML_TYPE_Q8_0:    return fg_visit_layout<block_q8_0>(reordered, f);
+        case GGML_TYPE_Q4_0:    return fg_visit_layout<block_q4_0>(reordered, f);
         case GGML_TYPE_Q4_K:    return fg_visit_layout<block_q4_K>(reordered, f);
         case GGML_TYPE_Q5_K:    return fg_visit_layout<block_q5_K>(reordered, f);
         case GGML_TYPE_Q6_K:    return fg_visit_layout<block_q6_K>(reordered, f);

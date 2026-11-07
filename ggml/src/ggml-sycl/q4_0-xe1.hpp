@@ -11,5 +11,9 @@ void ggml_sycl_q4_0_xe1_mul_mat_vec(const void * vx, const void * vy, float * ds
 bool ggml_sycl_q4_0_xe1_mul_mat_vec_multi(const void * const * vx, float * const * dst, const int * nrows, int nm,
                                           const void * vy, int ncols, dpct::queue_ptr stream);
 // fused gate / up mat-vecs + SWIGLU: dst[r] = silu(gate . y) * (up . y)
+// MoE: one mat-vec per routed expert (ids on the device, -1 = skipped slot), each expert slice in the reorder layout
+void ggml_sycl_q4_0_xe1_mul_mat_vec_id(const void * vx_base, const void * vy, const int32_t * ids, float * dst_base,
+                                       int ncols, int nrows, int n_used, size_t expert_stride, size_t dst_row_stride,
+                                       size_t src1_row_stride, dpct::queue_ptr stream);
 void ggml_sycl_q4_0_xe1_swiglu(const void * wg, const void * wu, const void * vy, float * dst, int ncols, int nrows,
                                dpct::queue_ptr stream);

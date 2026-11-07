@@ -4743,6 +4743,17 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder(
     size_t             src1_row_stride,
     dpct::queue_ptr    stream) {
     switch (src0_type) {
+        case GGML_TYPE_Q4_0:
+            // [a770-opt] whole-block-per-lane kernel on Alchemist (ncols % 512 == 0: the q8_1 SoA scales start at ncols)
+            if (ggml_sycl_q4_0_xe1_enabled(ggml_sycl_get_device()) && ncols % 512 == 0) {
+                ggml_sycl_q4_0_xe1_mul_mat_vec_id(vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                                                  expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+                return true;
+            }
+            launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_0>>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            return true;
         case GGML_TYPE_Q8_0:
             launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>>(
                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,

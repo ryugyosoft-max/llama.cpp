@@ -5196,6 +5196,45 @@ static bool reorder_qw_q8_0_moe(uint8_t * data_device, size_t expert_bytes, int6
     return true;
 }
 
+// [a770-opt] Q4_0 experts: each expert slice gets the dense reorder layout ([qs 16 B per block][d]), so the Alchemist
+// q4_0-xe1 mat-vec and the grouped XMX GEMM read a slice exactly like a dense reordered Q4_0 matrix
+static bool reorder_qw_q4_0_moe(uint8_t * data_device, size_t expert_bytes, int64_t n_expert, dpct::queue_ptr stream) {
+    GGML_ASSERT(expert_bytes % sizeof(block_q4_0) == 0);
+    const int    blocks_per_expert = (int) (expert_bytes / sizeof(block_q4_0));
+    const size_t total_bytes       = expert_bytes * (size_t) n_expert;
+
+    sycl_reorder_temp_buffer tmp(stream, total_bytes);
+    if (!tmp) {
+        GGML_LOG_WARN("%s: failed to allocate %zu bytes for reorder temp buffer, skipping reorder\n", __func__, total_bytes);
+        return false;
+    }
+    uint8_t * tmp_buf = static_cast<uint8_t *>(tmp.ptr);
+
+    sycl::event copy_event;
+    SYCL_CHECK(CHECK_TRY_ERROR(copy_event = stream->memcpy(tmp_buf, data_device, total_bytes)));
+    if (!g_ggml_sycl_use_async_mem_op) {
+        copy_event.wait();
+    }
+
+    const int total_blocks = blocks_per_expert * (int) n_expert;
+    auto reorder_event = stream->parallel_for(total_blocks, [=](auto gb_) {
+        const int          gb   = gb_;
+        const int          e    = gb / blocks_per_expert;
+        const int          ib   = gb % blocks_per_expert;
+        const block_q4_0 * x    = (const block_q4_0 *) (tmp_buf + (size_t) e * expert_bytes);
+        uint8_t *          base = data_device + (size_t) e * expert_bytes;
+        sycl::half *       d_ptr = (sycl::half *) (base + (size_t) blocks_per_expert * (QK4_0 / 2));
+        for (int j = 0; j < QK4_0 / 2; ++j) {
+            base[(size_t) ib * (QK4_0 / 2) + j] = x[ib].qs[j];
+        }
+        d_ptr[ib] = x[ib].d;
+    });
+    if (!g_ggml_sycl_use_async_mem_op) {
+        reorder_event.wait_and_throw();
+    }
+    return true;
+}
+
 static bool reorder_qw_q4_k(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
     GGML_ASSERT(size % sizeof(block_q4_K) == 0);
     GGML_ASSERT(offset % sizeof(block_q4_K) == 0);
@@ -5722,6 +5761,8 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
         switch (src0->type) {
             case GGML_TYPE_Q8_0:
                 return reorder_qw_q8_0_moe(data_device, src0->nb[2], src0->ne[2], stream);
+            case GGML_TYPE_Q4_0:
+                return reorder_qw_q4_0_moe(data_device, src0->nb[2], src0->ne[2], stream);
             case GGML_TYPE_Q4_K:
                 return reorder_qw_q4_k_moe(data_device, src0->nb[2], src0->ne[2], stream);
             case GGML_TYPE_Q5_K:
@@ -5822,7 +5863,7 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
     if (!g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder) {
         return;
     }
-    if (src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_Q4_K &&
+    if (src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q4_0 &&
         src0->type != GGML_TYPE_Q5_K && src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_MXFP4) {
         return;
     }
@@ -6054,14 +6095,17 @@ static int64_t mmvq_chunk_max() {
 //   Q4_K: per-call repack to natural-order u4 + scale d * sc per 32; the min term -dmin * m_j * sum_j(x) is folded
 //         into the same GEMM as a 9th group of 32 columns per 256-block (no integer zero point can express it).
 //   Q6_K: per-call repack to s8 (q - 32) + scale d * sc per 16.
-// GGML_SYCL_WD_DNNL=0 turns it off, GGML_SYCL_WD_DNNL_MIN = fewest tokens (default 32).
+// GGML_SYCL_WD_DNNL=0 turns it off, GGML_SYCL_WD_DNNL_MIN = fewest tokens (default 32; _MIN_ID for MoE experts, 4).
 static bool ggml_sycl_wd_dnnl(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                               ggml_tensor * dst) {
     static const bool on  = ggml_sycl_knob("GGML_SYCL_WD_DNNL", 1) != 0;
     static const int  min = getenv("GGML_SYCL_WD_DNNL_MIN") ? atoi(getenv("GGML_SYCL_WD_DNNL_MIN")) : 32;
+    // [a770-opt] MoE expert slices (MUL_MAT_ID's per-expert loop): from 4 rows (LFM2.5 24B-A2B pp512 1337 -> 1523)
+    static const int  min_id = getenv("GGML_SYCL_WD_DNNL_MIN_ID") ? atoi(getenv("GGML_SYCL_WD_DNNL_MIN_ID")) : 4;
     const ggml_type   type = src0->type;
     if (!on || !g_ggml_sycl_enable_dnn || (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q6_K) ||
-        dst->op != GGML_OP_MUL_MAT || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || src1->ne[1] < min ||
+        (dst->op != GGML_OP_MUL_MAT && dst->op != GGML_OP_MUL_MAT_ID) || src1->type != GGML_TYPE_F32 ||
+        dst->type != GGML_TYPE_F32 || src1->ne[1] < (dst->op == GGML_OP_MUL_MAT_ID ? min_id : min) ||
         src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || !ggml_is_contiguous(src0) ||
         src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) || dst->nb[1] % sizeof(float) != 0 ||
         src0->ne[0] % ggml_blck_size(type) != 0 || src0->view_src != nullptr ||
@@ -6073,6 +6117,9 @@ static bool ggml_sycl_wd_dnnl(ggml_backend_sycl_context & ctx, const ggml_tensor
         return false;
     }
     if (!extra->optimized_feature.reorder) {  // install the decode layout now (the next decode would do it anyway)
+        if (dst->op == GGML_OP_MUL_MAT_ID) {  // [a770-opt] an expert slice: only the whole tensor may be reordered
+            return false;
+        }
         if (!g_ggml_sycl_enable_optimize || !ctx.opt_feature.reorder || !reorder_qw(src0, ctx.stream())) {
             return false;
         }
@@ -7155,8 +7202,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             dst->type == GGML_TYPE_F32 && nb11 == sizeof(float)*ne10 && nb1 == sizeof(float)*ne0) {
             // the grouped GEMM reads the reorder (SoA) layout faster, and the first decode step installs it
             // anyway: install it here already, so prefill does not depend on whether a decode ran before
-            if (g_ggml_sycl_dynamic_precision != GGML_SYCL_DYNAMIC_PRECISION_F32 &&
-                ggml_sycl_xmx_gather_type_enabled(src0->type)) {
+            // [a770-opt] Q4_0 too: its experts' prompt GEMMs (oneDNN u4) read the reorder layout in place
+            if ((g_ggml_sycl_dynamic_precision != GGML_SYCL_DYNAMIC_PRECISION_F32 &&
+                 ggml_sycl_xmx_gather_type_enabled(src0->type)) || src0->type == GGML_TYPE_Q4_0) {
                 opt_for_reorder_id(&ctx, src0);
             }
             const bool src0_reordered =

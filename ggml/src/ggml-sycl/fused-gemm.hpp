@@ -11,7 +11,7 @@ static constexpr int GGML_SYCL_FG_MAX_N = 64; // widest N taken; each shape cove
 constexpr bool ggml_sycl_fused_dequant_gemm_type_ok(ggml_type src0_type, int64_t K) {
     // iq4_nl and q8_0 store 32 values per block; every other format here is a 256-value superblock
     // that the A stage walks in steps of 32, so K must cover whole superblocks.
-    if (src0_type == GGML_TYPE_IQ4_NL || src0_type == GGML_TYPE_Q8_0) {
+    if (src0_type == GGML_TYPE_IQ4_NL || src0_type == GGML_TYPE_Q8_0 || src0_type == GGML_TYPE_Q4_0) {
         return K % 32 == 0;
     }
     const bool superblock =
@@ -60,6 +60,7 @@ inline bool ggml_sycl_xmx_gather_type_enabled(ggml_type src0_type) {
         case GGML_TYPE_Q4_K:    return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_Q4_K    ) != 0;
         case GGML_TYPE_Q5_K:    return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_Q5_K    ) != 0;
         case GGML_TYPE_Q6_K:    return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_Q6_K    ) != 0;
+        case GGML_TYPE_Q4_0:    return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_Q4_0    ) != 0;
         default:          return false;
     }
 }
