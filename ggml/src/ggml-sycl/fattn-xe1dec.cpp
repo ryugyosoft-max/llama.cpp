@@ -680,7 +680,7 @@ constexpr int TP = 16;  // positions per step (two 8-row DPAS for Q.K^T, one 16-
 
 template <int KVT> struct kv;
 template <> struct kv<GGML_TYPE_Q4_0> { static constexpr int BB = 18, QD = 4, RD = 8;  };  // qs dwords, dwords read
-template <> struct kv<GGML_TYPE_Q8_0> { static constexpr int BB = 34, QD = 8, RD = 16; };
+template <> struct kv<GGML_TYPE_Q8_0> { static constexpr int BB = 34, QD = 8, RD = 9; };  // [a770-opt] 9 of 16 dwords used
 
 // R rows of one block each: RD dwords from the dword-aligned start of the block (one LSC gather per 8 dwords x R
 // rows); returns the QD qs dwords per row (funnel-shifted when the block starts 2 bytes into a dword) and the scales
@@ -692,6 +692,12 @@ ESIMD_INLINE esimd::simd<uint32_t, R * kv<KVT>::RD> issue_rows(const char * base
     using namespace esimd;
     constexpr int RD = kv<KVT>::RD;
     simd<uint32_t, R * RD> wc;
+    if constexpr (KVT == GGML_TYPE_Q8_0) {
+        // [a770-opt] finish_rows reads dwords 0..QD (9 of the 16): one 8-dword gather + one 1-dword gather
+        wc.template select<R * 8, 1>(0) = gather<uint32_t, R * 8, 8>((const uint32_t *) base, ro);
+        wc.template select<R, 1>(8 * R) = gather<uint32_t, R, 1>((const uint32_t *) base, ro + 32u);
+        return wc;
+    }
 #pragma unroll
     for (int c = 0; c < RD / 8; ++c) {
         wc.template select<R * 8, 1>(c * 8 * R) = gather<uint32_t, R * 8, 8>((const uint32_t *) base, ro + 32u * c);
@@ -717,12 +723,16 @@ ESIMD_INLINE void finish_rows(esimd::simd<uint32_t, R * kv<KVT>::RD> wc, const b
     d = convert<float>(sh.template bit_cast_view<sycl::half>().read());
 }
 
-template <int D, int KVT>
-ESIMD_INLINE void thread(const xe1dec_params p, const int gqa, const int kvh, const int split, const int iqt, const int tid) {
+// G KV heads per work-group (NT threads each, own SLM slice): a 2-thread work-group (D 64) left most of the A770
+// idle, the per-Xe-core work-group limit capped the resident threads
+template <int D, int KVT, int G>
+ESIMD_INLINE void thread(const xe1dec_params p, const int gqa, const int kvh, const int split, const int iqt, const int tid,
+                         const int grp) {
     using namespace esimd;
     constexpr int NT = D / 32;
     constexpr int BB = kv<KVT>::BB, QD = kv<KVT>::QD, RD = kv<KVT>::RD;
-    slm_init<NT * TP * 8 * sizeof(float)>();
+    slm_init<G * NT * TP * 8 * sizeof(float)>();
+    const uint32_t slm0 = (uint32_t) grp * NT * TP * 8 * sizeof(float);
 
     const int head0 = kvh * gqa;
     simd<uint32_t, 64> bq = 0;
@@ -798,12 +808,12 @@ ESIMD_INLINE void thread(const xe1dec_params p, const int gqa, const int kvh, co
             simd<float, 8> dkh = dk.template select<8, 1>(8 * h);
             sp.template select<64, 1>(64 * h) = (convert<float>(ci) - qs8r) * dqr * dkh.template replicate_vs_w_hs<8, 1, 8, 0>(0);
         }
-        slm_block_store<float, TP * 8>(tid * TP * 8 * sizeof(float), sp);
+        slm_block_store<float, TP * 8>(slm0 + tid * TP * 8 * sizeof(float), sp);
         barrier();
-        simd<float, TP * 8> s = slm_block_load<float, TP * 8>(0);
+        simd<float, TP * 8> s = slm_block_load<float, TP * 8>(slm0);
 #pragma unroll
         for (int t = 1; t < NT; ++t) {
-            s += slm_block_load<float, TP * 8>(t * TP * 8 * sizeof(float));
+            s += slm_block_load<float, TP * 8>(slm0 + t * TP * 8 * sizeof(float));
         }
         barrier();
 
@@ -899,16 +909,28 @@ ESIMD_INLINE void thread(const xe1dec_params p, const int gqa, const int kvh, co
     }
 }
 
-template <int D, int KVT>
-static void launch(const xe1dec_params & p, int gqa, int nkvh, int nsplit, dpct::queue_ptr stream) {
+template <int D, int KVT, int G>
+static void launch_g(const xe1dec_params & p, int gqa, int nkvh, int nsplit, dpct::queue_ptr stream) {
     constexpr int NT = D / 32;
     const int     nq = p.nq;  // one work-group per query token (MTP verification re-reads the cache per token)
-    stream->parallel_for(sycl::nd_range<1>((size_t) nkvh * nsplit * nq * NT, NT), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+    const int     ng = nkvh / G;
+    stream->parallel_for(sycl::nd_range<1>((size_t) ng * nsplit * nq * NT * G, NT * G), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
         int g = (int) it.get_group(0);
-        const int kvh = g % nkvh;
-        g /= nkvh;
-        thread<D, KVT>(p, gqa, kvh, g % nsplit, g / nsplit, (int) it.get_local_id(0));
+        const int lid = (int) it.get_local_id(0);
+        const int kvh = (g % ng) * G + lid / NT;
+        g /= ng;
+        thread<D, KVT, G>(p, gqa, kvh, g % nsplit, g / nsplit, lid % NT, lid / NT);
     });
+}
+
+template <int D, int KVT>
+static void launch(const xe1dec_params & p, int gqa, int nkvh, int nsplit, dpct::queue_ptr stream) {
+    // [a770-opt] up to 8 threads per work-group (GGML_SYCL_XE1X_G caps the heads per group)
+    constexpr int NT = D / 32;
+    static const int gmax = getenv("GGML_SYCL_XE1X_G") ? atoi(getenv("GGML_SYCL_XE1X_G")) : 8 / NT;
+    if (NT <= 2 && gmax >= 4 && nkvh % 4 == 0) { launch_g<D, KVT, (NT <= 2 ? 4 : 1)>(p, gqa, nkvh, nsplit, stream); return; }
+    if (NT <= 4 && gmax >= 2 && nkvh % 2 == 0) { launch_g<D, KVT, (NT <= 4 ? 2 : 1)>(p, gqa, nkvh, nsplit, stream); return; }
+    launch_g<D, KVT, 1>(p, gqa, nkvh, nsplit, stream);
 }
 }  // namespace xe1x
 
