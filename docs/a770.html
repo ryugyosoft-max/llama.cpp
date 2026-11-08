@@ -206,7 +206,7 @@ td.g { color: var(--ink); }
 <div class="row"><span class="rl">公式 llama.cpp Vulkan</span><div class="track"><div class="bar c-vk" style="width:23.76%"></div></div><span class="rv">38.0</span></div>
 <div class="row"><span class="rl">公式 llama.cpp SYCL</span><div class="track"><div class="bar c-sy" style="width:30.77%"></div></div><span class="rv">49.2</span></div>
 <div class="row"><span class="rl">PrismML フォーク （改造前）</span><div class="track"><div class="bar c-pb" style="width:33.19%"></div></div><span class="rv">53.1</span></div>
-<div class="row"><span class="rl">今回の A770 版</span><div class="track"><div class="bar c-us" style="width:41.28%"></div></div><span class="rv">66.0</span></div>
+<div class="row"><span class="rl">今回の A770 版</span><div class="track"><div class="bar c-us" style="width:41.28%"></div></div><span class="rv">66.1</span></div>
 <div class="row ref"><span class="rl">RTX 5060（手元の実測）</span><div class="track"><div class="bar c-rtx" style="width:44.25%"></div></div><span class="rv">70.8</span></div>
 </div></div>
 <div class="grp"><div class="gl"><b>Bonsai 2 9B</b><span>三値 PTQ1_0 *</span></div><div class="bars">
@@ -271,7 +271,7 @@ td.g { color: var(--ink); }
 <tr><td class="t">tg128</td><td class="n">41.4</td><td class="n">54.6</td><td class="n">55.1</td><td class="n us">91.1</td><td class="n">97.9</td><td class="n g">2.2×</td><td class="n"><span>93%</span></td></tr>
 <tr class="gs"><td rowspan="3" class="m"><b>Qwen3.5 9B</b><br><span>Q4_K_M</span></td><td class="t">pp512</td><td class="n">838</td><td class="n">1,665</td><td class="n">1,762</td><td class="n us">2,439</td><td class="n">2,437</td><td class="n g">2.9×</td><td class="n"><span class="win">100%</span></td></tr>
 <tr><td class="t">pp2048</td><td class="n">779</td><td class="n">1,663</td><td class="n">1,767</td><td class="n us">2,446</td><td class="n">2,637</td><td class="n g">3.1×</td><td class="n"><span>93%</span></td></tr>
-<tr><td class="t">tg128</td><td class="n">38.0</td><td class="n">49.2</td><td class="n">53.1</td><td class="n us">66.0</td><td class="n">70.8</td><td class="n g">1.7×</td><td class="n"><span>93%</span></td></tr>
+<tr><td class="t">tg128</td><td class="n">38.0</td><td class="n">49.2</td><td class="n">53.1</td><td class="n us">66.1</td><td class="n">70.8</td><td class="n g">1.7×</td><td class="n"><span>93%</span></td></tr>
 <tr class="gs"><td rowspan="3" class="m"><b>Bonsai 2 9B</b><br><span>三値 PTQ1_0 *</span></td><td class="t">pp512</td><td class="n">323</td><td class="n">1,579</td><td class="n">2,210</td><td class="n us">2,715</td><td class="n">2,699</td><td class="n g">8.4×</td><td class="n"><span class="win">101%</span></td></tr>
 <tr><td class="t">pp2048</td><td class="n">313</td><td class="n">1,578</td><td class="n">2,223</td><td class="n us">2,700</td><td class="n">2,626</td><td class="n g">8.6×</td><td class="n"><span class="win">103%</span></td></tr>
 <tr><td class="t">tg128</td><td class="n">26.1</td><td class="n">30.1</td><td class="n">59.1</td><td class="n us">140.7</td><td class="n">155.5</td><td class="n g">5.4×</td><td class="n"><span>90%</span></td></tr>
@@ -326,7 +326,7 @@ td.g { color: var(--ink); }
         <div class="where">生成（デコード）</div>
         <div class="claim">アセンブリで原因を特定し、XMX の DPAS 命令を ESIMD で直接書いた</div>
         <p>アセンブリを読むと、16 バイトのロードが 4 バイトずつに分解されていたり、添字計算が 64bit 整数の模倣命令の連鎖になっていたりしました。量子化 KV キャッシュの Flash Attention は、行列演算命令（DPAS）を直接呼ぶ形で書いています。</p>
-        <div class="num">FA デコード 2× · 64bit 添字の除去で約 +10% · Bonsai 59 → 141 t/s</div>
+        <div class="num">FA デコード 2× · 64bit 添字の除去で約 +10% · Bonsai 59.1 → 140.7 t/s</div>
       </div>
     </div>
     <p class="soft">どれも「動くが、A770 向けには詰め切られていない」部分でした。汎用のコンパイラ出力や既存の実装は、より新しい GPU や他社の GPU を主な対象にしていて、Alchemist の癖（64bit 整数を持たない、レジスタ 128 本、XMX の幅 8）までは追い込まれていません。そこを埋めるだけで、この差が出ました。</p>
