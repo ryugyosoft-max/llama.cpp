@@ -279,7 +279,7 @@ td.g { color: var(--ink); }
 <tr><td class="t">pp2048</td><td class="n">162</td><td class="n">515</td><td class="n">641</td><td class="n us">855</td><td class="n">858</td><td class="n g">5.3×</td><td class="n"><span>100%</span></td></tr>
 <tr><td class="t">tg128</td><td class="n">16.0</td><td class="n">9.7</td><td class="n">27.0</td><td class="n us">44.2</td><td class="n">57.9</td><td class="n g">2.8×</td><td class="n"><span>76%</span></td></tr>
 </tbody></table></div>
-    <p class="note">すべて同じマシンで <code>llama-bench -ngl 999 -fa 1 -p 512,2048 -n 128</code>（5 回平均）。RTX 5060 の列は、同じモデルファイルを使った GeForce RTX 5060 での手元の実測値です。「公式 Vulkan 比」は今回の版 ÷ 公式 Vulkan。</p>
+    <p class="note">A770 の列はすべて同じマシンで <code>llama-bench -ngl 999 -fa 1 -p 512,2048 -n 128</code>（5 回平均）。RTX 5060 の列は、同じモデルファイルを使った GeForce RTX 5060（Windows 11、無改造の PrismML フォークを CUDA でビルド、3 回平均）での手元の実測値です。「公式 Vulkan 比」は今回の版 ÷ 公式 Vulkan。</p>
   </section>
 
   <section>
@@ -380,7 +380,7 @@ td.g { color: var(--ink); }
       <dt>ホスト</dt><dd>Xeon w9-3475X、Ubuntu 26.04.1、Linux 7.0、Intel compute-runtime 26.05.37020、oneAPI 2026.2、Mesa 26.0.8</dd>
       <dt>比較対象</dt><dd>公式 llama.cpp build 12110（cd959bae9）の Vulkan 版・SYCL 版、PrismML フォークの改造前（62c418c）、今回の版（その上に 39 コミット、ggml-sycl 約 5,700 行）</dd>
       <dt>計測</dt><dd><code>llama-bench -ngl 999 -fa 1 -p 512,2048 -n 128</code>、5 回平均、既定のバッチ（ubatch 512）</dd>
-      <dt>RTX 5060</dt><dd>GeForce RTX 5060 で、同じモデルファイルを使った手元の実測値（4 モデル全項目）</dd>
+      <dt>RTX 5060</dt><dd>GeForce RTX 5060 8GB、Core Ultra 9 285HX、Windows 11、NVIDIA ドライバ 610.88、CUDA 13.3。PrismML フォーク（c96baf4）を改造せずに CUDA でビルド。同じモデルファイルで <code>llama-bench -ngl 99 -fa 1</code>、3 回平均（4 モデル全項目）。Bonsai 2 27B は 8GB にぎりぎりで、他のアプリが VRAM を約 2GB 使っている状態では溢れて 1.6 t/s まで落ちるため、アプリを閉じて測っています</dd>
       <dt>正しさ</dt><dd>各段階で test-backend-ops（CPU 実装との比較）とパープレキシティ（デコード経路は 1 トークンずつ）を確認。PPL は誤差の範囲内で不変</dd>
     </dl>
   </section>
