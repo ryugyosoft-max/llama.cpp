@@ -1,7 +1,7 @@
 # llama.cpp
 
 > [!NOTE]
-> **Branch `a770-prism`: Intel Arc A770 (Alchemist) tuning of the SYCL backend.** About the level of a GeForce RTX 5060 on the same models. See [docs/a770.md](docs/a770.md).
+> **Branch `a770-prism`: Intel Arc A770 (Alchemist) tuning of the SYCL backend.** About the level of a GeForce RTX 5060 on the same models. See [docs/a770.md](docs/a770.md), or the write-up with charts (Japanese): [https://ryugyosoft-max.github.io/llama.cpp/a770.html](https://ryugyosoft-max.github.io/llama.cpp/a770.html).
 
 > [!IMPORTANT]
 > **This is the PrismML fork of llama.cpp**, the main line behind the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models (branch `prism`, developed as `prism-v7`). It tracks current mainline llama.cpp and adds the fork's low-bit formats and runtime features on top.
