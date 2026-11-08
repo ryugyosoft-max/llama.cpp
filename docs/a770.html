@@ -314,13 +314,13 @@ td.g { color: var(--ink); }
         <div class="where">プリフィル</div>
         <div class="claim">アセンブラは不要。行列積は Intel 自身の oneDNN に任せた</div>
         <p>4bit / 8bit の重みのまま XMX に流す「重み圧縮 GEMM」が oneDNN に用意されていました。llama.cpp の汎用経路はこれを使わず、毎回 f16 に展開してから掛けていました。</p>
-        <div class="num">55〜90 TFLOPS 相当 · Llama pp512 1,849 → 3,761</div>
+        <div class="num">55〜90 TFLOPS 相当 · Llama pp512 1,741 → 3,673</div>
       </div>
       <div class="card">
         <div class="where">線形アテンション（DeltaNet）</div>
         <div class="claim">アセンブリを読み、ESIMD でレジスタを手で配置</div>
         <p>コンパイラはループを展開すると全ロードを先頭へ寄せ、1 スレッドあたり 2〜9 KB をスタックへ溢れさせていました。そのままでは逐次版より遅かったものを、ESIMD で書き直してスピル 0 にしています。</p>
-        <div class="num">スピル 9 KB → 0 · Qwen pp512 2,295 → 2,481</div>
+        <div class="num">スピル 9 KB → 0 · Qwen pp512 1,762 → 2,439</div>
       </div>
       <div class="card">
         <div class="where">生成（デコード）</div>
@@ -342,10 +342,10 @@ td.g { color: var(--ink); }
       <div class="step"><div class="tag"><b>プリフィル</b>行列積</div><ul>
         <li>4bit / 8bit の重みを f16 に展開してから掛けていたのをやめ、oneDNN の「重み圧縮 GEMM」で量子化重みのまま XMX に流しました。</li>
         <li>Q4_0 は推論用に並べ替え済みのメモリをそのまま読み、ニブル順の違いは入力側を並べ替えて吸収。Q4_K は最小値の項を「9 番目のグループ」として同じ行列積に畳み込みました。</li>
-        <li class="res">Llama 2 7B pp512：1,849 → 3,761</li></ul></div>
+        <li class="res">Llama 2 7B pp512：1,741 → 3,673</li></ul></div>
       <div class="step"><div class="tag"><b>線形アテンション</b>Gated DeltaNet</div><ul>
         <li>Qwen3.5 / Bonsai の DeltaNet 層は 1 トークンずつ状態を更新する逐次処理でした。32 トークンごとのチャンク形式（UT/WY 変換）に書き換え、チャンク間の逐次部分だけを ESIMD で手書きしてレジスタ溢れを無くしました。</li>
-        <li class="res">Qwen3.5 9B pp512：2,295 → 2,481</li></ul></div>
+        <li class="res">Qwen3.5 9B pp512：1,762 → 2,439</li></ul></div>
       <div class="step"><div class="tag"><b>生成（Llama）</b>行列ベクトル積</div><ul>
         <li>Q4_0 の行列ベクトル積を「1 レーン 1 ブロック・複数行で入力共有」に書き直し、正規化や SwiGLU が次の積用の 8bit 量子化を自分で書く融合を追加。量子化 KV キャッシュの Flash Attention は XMX（DPAS 命令）で実装しました。</li>
         <li class="res">Llama 2 7B tg128：55.1 → 91.1</li></ul></div>
